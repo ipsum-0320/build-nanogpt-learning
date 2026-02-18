@@ -184,3 +184,121 @@ class GPT(nn.Module):
             ln_f = nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+    def forward(self, idx, targets=None):
+        # idx is of shape (B, T)
+        B, T = idx.size()
+        assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
+        # forward the token and posisition embeddings
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T)
+        # torch.range 有点类似于 python 的 range，它直接创建一个 PyTorch 张量（Tensor），一维的 [0, T)。
+        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (T, n_embd)
+        # 这里会进行向量计算，或者说矩阵计算，将 pos 进行向量化。
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (B, T, n_embd)
+        # 这里也进行矩阵计算，将 tok 向量化。
+        # nn.Embedding 是专门为了优化与 one-hot 编码的计算而出现的，因此其物理实现是查表操作——output = wte.weight[idx]。
+
+        x = tok_emb + pos_emb
+        # 这里会进行 tensor 的广播。
+        # 每一个 Batch 里的每一行，都加上了相同的一套位置向量。
+
+        # forward the blocks of the transformer
+        for block in self.transformer.h:
+            x = block(x)
+            # 做特征提取，其实就是过了很多层的 Transformer Encoder。
+        # forward the final layernorm and the classifier
+        x = self.transformer.ln_f(x)
+        # 做了归一化。
+        # 现在来解释一下为什么需要做归一化：
+        # 在深度学习中，特征最终要通过激活函数（如 GeLU, ReLU, Softmax）。如果输入的数值（Logits）非常大（比如 100）或非常小（比如 -100），Softmax 的梯度会变得极其微小（接近 0）。均值 0，方差 1 的意义：这保证了大部分数值都落在 $[-2, 2]$ 这个范围内。在这个区间内，Softmax 和其他激活函数的梯度最灵敏，模型能学得最快。直观理解：如果数值失控，模型就像进入了“死胡同”，无论怎么调整参数，输出几乎没变化，模型就“学不动”了。
+        # 此外，归一化后，等 Loss 线比较圆，不圆（椭圆）：梯度震荡，学习率得设得很小，训练慢；圆（圆形）：梯度顺畅，学习率可以设大，训练快且稳。
+        # 因此加了归一化后，解决残差累加导致的数值爆炸，配合 lm_head（线性层）进行高效分类，确保训练的稳定性（尤其是针对 Pre-Norm 架构）。
+
+        # Pre-Norm 还是 Post-Norm
+        # A. Post-Norm（原始 Transformer 做法）结构： x = LayerNorm(x + SubLayer(x))逻辑： 先计算，再加残差，最后归一化。缺点： 归一化层在输出端，梯度回传时会受到较大干扰，导致深层模型很难训练（容易崩）。
+        # B. Pre-Norm（现在 GPT 的主流做法，即你这段代码所属的架构）结构： x = x + SubLayer(LayerNorm(x))逻辑： 在每一层计算之前先归一化。优点： 梯度可以从残差连接（那个 x + ...）中无损地流向很深的层。这让训练几十层甚至上百层的模型变得非常稳定。为什么还需要 ln_f？ 因为 Pre-Norm 架构中，主干路径上的 $x$ 一直在累加，没有被整体归一化过，所以最后必须补一刀 ln_f，把数值拉回“圆润”的分布。
+
+        # 是不是每一层后面都要加归一化层？
+        # 是的，在 Transformer 架构中，归一化就像是每一层的“标配呼吸机”。 * Block 内部：负责维持每一层特征提取的稳定。最后的 ln_f：负责给所有层的累积结果做一个最终的“质检”和“格式化”，确保交给分类器的数据是完美分布的。
+        logits = self.lm_head(x) # (B, T, n_embd) * (n_embd, vocab_size) = (B, T, vocab_size)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
+    
+    @classmethod
+    # 这里的 @classmethod 装饰器用于将普通方法转换为类方法，核心作用的是绑定到类本身（而非类的实例），无需创建类的对象即可调用。
+    def from_pretrained(cls, model_type):
+        """Loads pretrained GPT-2 model weights from huggingface"""
+        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
+        from transformers import GPT2LMHeadModel
+        print("loading weights from pretrained gpt: %s" % model_type)
+
+        # n_layer, n_head and n_embd are determined from model_type
+        config_args = {
+            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
+            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
+            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
+            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
+        }[model_type]
+        config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
+        config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
+        # create a from-scratch initialized minGPT model
+        config = GPTConfig(**config_args)
+        # 创建 config 配置。
+        model = GPT(config)
+        sd = model.state_dict()
+        # 获取自定义模型的参数字典
+        sd_keys = sd.keys()
+        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
+        # 在 PyTorch 的 nn.Module 中，这种不需要梯度更新、但需要随模型一起保存的张量被称为 Buffer（缓存）。
+        # 真正的偏置：比如 attn.c_attn.bias，它是模型学习出来的，用来调整线性变换的结果。
+        # 这里的 .attn.bias：它其实是 tril（下三角矩阵）。在 Hugging Face 的实现里，它被注册为了一个 buffer，名字恰好叫 bias。
+
+        # 在 Pytorch 的 nn.Module 中，如果想存储一些数据，通常有两种方式：
+        # - Parameters，这就是我们常用的 nn.Parameter（或者 nn.Linear 里的 weight）。特点：它们需要计算梯度，会被优化器更新，且会自动包含在 state_dict 中。
+        # Buffers，这就是通过 register_buffer 注册的张量。特点：它们不需要计算梯度，不会被优化器更新，但它们依然会自动包含在 state_dict 中，并随模型一起保存和加载。一般来说，mask、绝对位置编码都会放在 Buffers 中，我们写的 y = F.scaled_dot_product_attention(...) 是目前最高效的 GPT 实现方式。它通过算法逻辑取代了物理存储。
+        # 当你通过 self.register_buffer('name', tensor) 注册一个张量后，它获得了三个普通变量没有的“特权”：
+        # - 跟随设备转移：当你执行 model.to('cuda') 时，所有 Buffer 会自动从 CPU 搬运到 GPU。
+        # - 自动序列化：当你执行 torch.save(model.state_dict(), 'path.pth') 时，Buffer 会被包含在字典里存入硬盘。
+        # - 不参与梯度更新：它永远不会出现在 optimizer.step() 的更新列表中，也不会计算导数。
+        # Buffers 对比普通属性：路人甲，不随行，不保存，self.my_attr = torch.zeros(3, 3)
+        # 使用 Buffers 可以是 self.mask = nn.Buffer(torch.tril(torch.ones(1024, 1024)))，也可用 self.register_buffer('my_buffer', tensor)
+
+        # init a huggingface/transformers model
+        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+        sd_hf = model_hf.state_dict()
+        # 获取官方模型的参数字典
+
+        # copy while ensuring all of the parameters are aligned and match in names and shapes
+        sd_keys_hf = sd_hf.keys()
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
+        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
+        # this means that we have to transpose these weights when we import them
+        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+        for k in sd_keys_hf:
+            if any(k.endswith(w) for w in transposed):
+                # special treatment for the Conv1D weights we need to transpose
+                assert sd_hf[k].shape[::-1] == sd[k].shape
+                # 通过 shape[::-1]，你实际上是在检查：“虽然这两个矩阵现在的形状不一样，但如果我把官方的转置（Transpose）一下，它们是不是就一样了？”
+                # [::-1]: 这是 Python 列表/元组的切片操作，表示倒序（反转），如果原形状是 (768, 2304)，反转后就变成了 (2304, 768)。
+                with torch.no_grad():
+                    # with torch.no_grad(): 是一个上下文管理器（Context Manager），它的核心作用是：暂时关闭梯度计算系统（Autograd 引擎）。通俗点说，它告诉 PyTorch：“接下来的操作我只是在搬运数据或者做推断，不需要你记录任何求导信息，也不需要为反向传播做准备。”
+                    # 默认情况下，当你对 PyTorch 的 Tensor（且 requires_grad=True）进行操作时，PyTorch 会在后台构建一个“计算图”来记录所有操作，以便后续计算导数。加载权重只是简单的赋值操作，完全不需要计算梯度。
+                    # 它能带来什么好处？内存优化：不记录计算图意味着不占用额外的显存/内存来存储中间激活值。速度提升：省去了后台追踪计算逻辑的时间，运行效率更高。
+                    # 一般来说，我们在模型推理或者手动加载权重时都需要关闭梯度系统。
+                    # with torch.no_grad(): 的有效范围仅限于其下方所有缩进一级的代码行。一旦代码恢复到原来的缩进级别，梯度追踪就会自动恢复。如果你想让整个函数都不追踪梯度，不需要缩进整个函数体，可以使用装饰器：@torch.no_grad()。
+                    # 下面这些参数都会来追踪梯度：
+                    # 模型前向传播、损失计算、权重加载/拷贝，索引切片、链接以及维度变化。
+                    sd[k].copy_(sd_hf[k].t())
+            else:
+                # vanilla copy over the other parameters
+                assert sd_hf[k].shape == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k])
+
+        return model
+    
+
