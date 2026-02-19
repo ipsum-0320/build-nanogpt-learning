@@ -4,9 +4,16 @@ import time
 import inspect
 from dataclasses import dataclass
 import torch
+import numpy as np
 import torch.nn as nn
 from torch.nn import functional as F
 from hellaswag import render_example, iterate_examples
+
+def load_tokens(filename):
+    npt = np.load(filename)
+    npt = npt.astype(np.int32) # added after video
+    ptt = torch.tensor(npt, dtype=torch.long)
+    return ptt
 
 class CausalSelfAttention(nn.Module):
     # 这里完整的实现了因果注意力机制。
@@ -24,6 +31,7 @@ class CausalSelfAttention(nn.Module):
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -128,6 +136,7 @@ class MLP(nn.Module):
         # 目前，在深度学习（尤其是计算机视觉和普通的深层感知机）领域，ReLU 及其变体确实占据了统治地位。
         # ReLU 其实引入了非线性，现代深度学习之所以强大，其实就是靠**“分段线性逼近（Piecewise Linear Approximation）”**。ReLU 的聪明之处在于：它保留了线性函数计算简单、梯度不消失（在正区间）的优点。它又通过那一个**“拐角”**，引入了足以模拟宇宙万物的非线性表达能力。
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -184,6 +193,71 @@ class GPT(nn.Module):
             ln_f = nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # weight sharing scheme
+        self.transformer.wte.weight = self.lm_head.weight # 这样的操作节省了 30% 的参数。
+        # 在像 GPT 这样的生成式 Transformer 模型中，模型最前端的 Token Embedding 层（将单词索引转换为向量）和最后端的 Language Model Head（将隐藏层向量映射回单词概率的线性分类层）使用的是同一组权重矩阵。
+        # 这种做法被称为 权重绑定（Weight Tying），最早由 Press 和 Wolf 在 2016 年提出。其背后的逻辑主要基于以下几个维度：
+        # 1. 语义空间的互通性。Embedding 层的作用是学习词与词之间的语义关系，将 N 维的 One-hot 编码压缩到连续的低维向量空间。**分类头（Linear Head）**的作用是计算当前隐藏状态与词表里每一个词的“相似度”。逻辑： 如果两个词在语义上相似，它们在 Embedding 空间中距离很近；那么在预测时，如果模型认为应该填入其中一个词，另一个词也理应获得较高的逻辑得分（Logits）。使用同一组权重能确保“输入语义”和“输出预测”在同一个坐标系下。
+        # 2. 节省海量的参数量在 GPT 模型中，词表大小（Vocabulary Size）通常在 50,000 到 100,000 之间，而隐藏层维度（Hidden Size）可能在 768 到 12,288 之间。如果两者不共享，权重参数量为：$2 \times (Vocab\_Size \times Hidden\_Size)$。对于大型模型，词表权重往往占了非 Transformer 模块参数的很大一部分。共享权重可以直接节省数亿个参数，显著降低显存占用。
+        # 3. 正则化与性能提升。研究表明，权重绑定起到了一种正则化的作用。由于输出层（分类头）在训练过程中更新非常频繁（每个 Token 都要计算交叉熵损失），这种更新信号会直接反馈给 Embedding 层。这有助于 Embedding 层更快地收敛，并防止模型在小语料上出现过拟合。
+
+        # init params
+        self.apply(self._init_weights)
+        # model.apply(fn) = 遍历模型里所有层、所有子模块 **，对每一层都执行一遍 fn 函数**
+
+    def _init_weights(self, module):
+        # 不对 nn.LayerNorm 做初始化，因为 nn.LayerNorm $\gamma=1, \beta=0$ 保持输入分布的标准化，不引入额外扰动。
+        # nn.LayerNorm 初始状态下，gamma 全是 1，beta 全是 0。 
+        # 在模型刚开始训练的第一步，我们希望 LayerNorm 只负责“稳定分布”，而不是去“干扰信号”。所以设为 1 和 0，相当于告诉模型：“先按标准分布传下去，改不改由你后面练出来再说。”
+        # $1/\sqrt{d}$ 解决了 $f(x)$ 内部的方差平衡。$1/\sqrt{2N}$ 解决了 $x + f(x)$ 叠加时的方差平衡。
+        if isinstance(module, nn.Linear):
+            # 根据 Xavier 初始化，初始化的参数权重的标准差分布应该满足 1/√d_model，所谓的 kai_ming 初始化也是类似的原理。
+            # 有一个前提是，方差越大，数值越大，这个是数学严格证明的。
+
+            # 那么权重初始化非要用 1/√d，不然训练就崩？我们核心目标只有一个：保证信号经过每一层后，输出的方差既不爆炸也不消失，维持在 1 左右。也就是每一层的输入输出都需要方差维持在 1 左右，那么为什么要维持在 1 左右呢？
+            # 在深度网络中，信号要经过 $L$ 层（比如 $L=50$），如果方差不为 1，那么经过多层之后，方差就会连乘，只有 1 能够抵抗指数级增长或衰减。 任何偏离 1 的微小因子，在深度学习的层数放大下，都会变成灾难。因此，我们只能依赖方差为 1。
+            # 综上所述，我们所有的初始化技巧（Xavier, Kaiming, 0.02 缩放，数据标准化）和归一化技术（LayerNorm, BatchNorm），全都是为了在每一层维持那个神秘的“方差 1”，y 和 x 的方差为 1。
+            # y = wx + b，一般来说，我们需要对输入数据进行标准化，保证 x 的方差为 1，然后通过 “Xavier, Kaiming, 0.02 缩放” 来保证权重 * d_model 之后方差也为 1，最后 wx 的方差也就为 1，然后 b 的方差设置为 0，这样就能保证 y 的输出方差也为 1 了。
+
+            # 好的，上述逻辑其实只保证了一点，那就是只保证了初始化是 y = wx + b 这套逻辑的 x 方差为 1，然后 y 方差也为 1，那如何保证训练过程中 y 的方差也为 1？
+            # 1. 首先是学习率，会比较小，如果学习率太大，如果学习率太大，权重 $W$ 会剧烈波动，方差瞬间爆炸。
+            # 2. LayerNorm。这是保证训练中方差稳定的定海神针。不管你的 $W$ 和 $b$ 在训练中变成了什么样，在每一层线性计算结束后，信号都会经过 LayerNorm：强制归零：它计算当前这一批数据的均值 $\mu$，然后减去它。强制归一：它计算当前数据的方差 $\sigma^2$，然后除以 $\sigma$。
+            
+            # 其中，LayerNorm 是更加重要的，所以这就是为什么 LayerNorm 需要再每一层后面都添加，就是为了让方差保持在 1。
+            # 那么 LayerNorm 中的 gamma 和 beta 两个可学习参数的作用是什么呢？一言以蔽之，为了重新让均值和方差不变为 0 和 1。这两个参数有如下几个作用：
+            # 1. “数值稳定性”与“表达能力”的博弈归一化（操作部分）：是为了数值稳定性。它像是一个“安全带”，保证数值不会飞到外太空（爆炸）或者缩到看不见（消失）。$\gamma$ 和 $\beta$（参数部分）：是为了表达能力。它像是一个“调节旋钮”。如果模型发现，某一层的特征必须要在数值很大时（比如方差为 10）才能触发后续的逻辑，那么模型可以自己通过训练把 $\gamma$ 调大。关键点：这赋予了模型一种**“自愈”**能力。模型可以自主决定：“这一层我需要标准分布”，或者“那一层我需要非标准分布”。
+            # 2. 保护非线性（不让激活函数“变傻”）这是最精妙的一点。很多激活函数在 $0$ 附近是线性的：比如 Tanh 和 Sigmoid：在 $0$ 附近几乎就是一条斜线。如果每一层都严格死守 $\mu=0, \sigma=1$，那么信号永远落在激活函数的线性区。后果：多层神经网络就会退化成一个巨大的线性层（线性层的堆叠还是线性层），失去了处理复杂逻辑的能力。
+            # 这也是为什么 LayerNorm 要一开始初始化为全 1 值和全 0 值。这意味着，在训练刚开始的第一秒，LayerNorm 确实是严格地把方差和均值限制在 $1$ 和 $0$。随着训练的进行，模型如果觉得“不爽”，它会通过反向传播自己去修改这两个值。
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                # 除了残差，别的地方都是 y = wx + b，因此之前的优化可以保证方差为 1，后来多了残差，就需要额外的优化手段了，也就是下面的这行代码。
+                std *= (2 * self.config.n_layer) ** -0.5
+                # 它是为了解决**“残差叠加导致的方差爆炸”**问题。
+                # 之前我们讨论过，初始化 $1/\sqrt{d}$ 是为了保证单个线性层（y = wx + b）的输入输出方差平衡。但在 Transformer Block 中，结构是这样的： y = x + wx + b。
+                # 这里的加法打破了平衡。根据方差的性质（假设 $x$ 和 $\text{Layer}(x)$ 独立）：$$\text{Var}(x + \text{Layer}(x)) = \text{Var}(x) + \text{Var}(\text{Layer}(x))$$如果 $x$ 的方差是 1，而 Layer 层的输出方差也是 1。那么经过 1 层后，$x_{next}$ 的方差就变成了 2。经过 $N$ 层后，方差就会线性增长到 $N$。对于一个 12 层的模型，最后一层的方差会是第一层的 12 倍；对于 GPT-3 这种 96 层的模型，方差会飙升到 96 倍。这会导致深层网络的数值极其不稳定。
+                # 上述代码，std *= (2 * n_layer) ** -0.5 也就是把标准差除以了 $\sqrt{2N}$。（注：这里的 $2$ 是因为每个 Transformer Block 包含两个子层：Self-Attention 和 MLP，所以总层数是 $2 \times n\_layer$）。
+
+                # 注意，我们这里缩减的是非残差部分的输出方差，将其缩短了 1/根号2N，只是为了保证残差的主干优先，让信号可以像在高速公路上一样，无损地从第 1 层冲到第 100 层。
+                # 因此我们不强行让每一层输出 $y$ 的方差都为 1（否则每一层 LN 都在做“除法”。经过 $N$ 层后，最初的输入信号 $x_0$ 贡献的权重会以 $\frac{1}{\sqrt{2}} \times \frac{1}{\sqrt{2}} \dots$ 的速度指数级衰减），而是选择使用 $1/\sqrt{2N}$ 缩放，$x_1$ 几乎和 $x$ 一模一样！原始信号被完美保留了。经过 $2N$ 层后：总方差变成了 $1 + \frac{1}{2N} \times 2N = 2$。
+                
+                # 一般来说，我们只会对出口地方进行降权，因为它是支流（非残差部分）汇入主干前的最后一关。就是在这里，支流的信号要和主干相加。为了不让这次相加导致主干方差变成 $1+1=2$，我们必须在 c_proj 这里把方差压下去。
+                # 在一个标准的 Transformer Block 中，通常只有两个层需要缩放，因为只有它们直接和主干相加：
+                # Attention 模块里的 c_proj：
+                # - 它负责把 Attention 的结果送回主干。
+                # MLP 模块里的 c_proj (通常是第二个 Linear 层)：
+                # - MLP 通常由两层组成：Linear1 -> ReLU/GELU -> Linear2。
+                # - 其中 Linear2 的结果会直接加回主干：x = x + MLP_output。因此，Linear2 也需要加上这个标记。
+
+                # 我们不能给残差 x 降级，否则就无法保护“恒等映射” (Identity Mapping)，这是残差的灵魂，主干 $x$ 是“保命线”，必须无损传递。我们要让信息能从第一层“瞬移”到最后一层。
+                # 之所以我们通过 $\sqrt{2N}$ 把支流压得很低，本质上是告诉模型：“你刚出生的时候，先别急着大刀阔斧地修改前人的成果。你先作为一个微小的修正项存在，等训练开始了，你觉得确实有必要，再通过权重更新把自己调大。”
+                torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+                # 避免在训练开始时引入人为的偏置（Bias），让模型从一张“白纸”开始学习特征。
+                # 如果说权重 (Weight) 决定了输入信号的“重要程度”，那么偏置 (Bias) 就决定了要触发神经元到底有多“难”。
+                # 这里会保证 b 的方差和均值都为 0。
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
         # idx is of shape (B, T)
@@ -224,7 +298,41 @@ class GPT(nn.Module):
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            # PyTorch 的 F.cross_entropy 期望输入是 二维 的（样本数, 类别数）。
+            # logits 变成：(B*T, vocab_size)，targets 变成：(B*T)。
+            # 这样每一行就是一个预测结果，对应一个正确标签。
+            # 基本上可以理解为如下：
+            #      logits       label
+            # softmax(@@@@@@@@)   @
+            # softmax(@@@@@@@@)   @
+            # softmax(@@@@@@@@)   @
+            # 在随机初始化权重参数的情况下，loss 应该就等于 1/V。
         return logits, loss
+    
+    def configure_optimizers(self, weight_decay, learning_rate, device_type):
+        # start with all of the candidate parameters (that require grad)
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        if master_process:
+            print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+            print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == "cuda"
+        if master_process:
+            print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        return optimizer
     
     @classmethod
     # 这里的 @classmethod 装饰器用于将普通方法转换为类方法，核心作用的是绑定到类本身（而非类的实例），无需创建类的对象即可调用。
@@ -302,3 +410,155 @@ class GPT(nn.Module):
         return model
     
 
+class DataLoaderLite:
+    # 这里的 DataLoader 是自定义的，同时具备了 DataLoader 和 DataSet 的功能。
+    # 在标准的 PyTorch 工作流中，数据加载通常被拆分为两个角色：Dataset：负责“有什么数据”以及“如何取某一条数据”（定义索引索引 $i$ 对应的内容）。DataLoader：负责“怎么取数据”（定义 Batch Size、是否打乱、多线程加载、分布式分发等）。你提供的这段 DataLoaderLite 确实将这两者合二为一了。
+    # 为什么它是 Dataset？
+    # 持有数据源：它直接管理 self.shards（磁盘上的文件列表）和 self.tokens（当前加载到内存的张量）。定义切片逻辑：它通过 buf[current_position : ...] 直接从原始序列中切出训练样本。
+    # 为什么它是 DataLoader？
+    # 状态管理：它自己维护指针 self.current_position，不需要外部循环提供索引。批处理（Batching）：它内部直接执行了 .view(B, T)，直接输出形状为 $(B, T)$ 的张量，而不是单条数据。分布式分发（Distributed Sharding）：它通过 process_rank 和 num_processes 实现了多机多卡的数据并行逻辑，这原本是 DistributedSampler 做的事情。
+
+    # 在 PyTorch 的常规开发中，使用 Dataset 和 DataLoader 这套标准 API 是绝对的主流。
+    # Dataset (食材库)它定义了数据的来源和读取方式。主要任务：告诉程序数据集有多大（__len__），以及给定一个序号 $i$ 后，如何把第 $i$ 个样本读出来（__getitem__）。类型：Map-style: 像字典一样，按索引取样（最常用）。Iterable-style: 像流一样，只能一直往后读（适合海量数据）。
+    # - 我们需要实现的方法： 如果我们自定义一个类继承自 Dataset，通常必须重写两个方法：
+    #   1. __len__：返回数据集的总样本数。
+    #   2. __getitem__：给定一个索引 i，返回对应的样本及其标签。
+
+    # DataLoader (厨师/传送带)它定义了数据如何组织成 Batch 并送到模型手里。主要任务：打乱顺序（Shuffle）、并行读取（Num Workers）、把 $B$ 个样本打包成 Tensor（Batching）、把数据搬运到 GPU，DataLoader 的功能如下：
+    #   - Batch Size（批量大小）： 将数据分块，比如一次给模型 32 个样本。
+    #   - Shuffle（打乱）： 每一轮训练（Epoch）开始前，随机打乱数据顺序，防止模型过拟合。
+    #   - Multiprocessing（多线程）： 使用 num_workers 开启多个进程并行加载数据，防止 CPU 加载太慢让 GPU “空转”。
+    #   - Drop Last： 如果总数据量不能被 Batch Size 整除，决定是否舍弃最后不完整的一块。
+    def __init__(self, B, T, process_rank, num_processes, split):
+        self.B = B
+        self.T = T
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        assert split in {'train', 'val'}
+
+        # get the shard filenames
+        data_root = "edu_fineweb10B"
+        shards = os.listdir(data_root)
+        shards = [s for s in shards if split in s]
+        shards = sorted(shards)
+        shards = [os.path.join(data_root, s) for s in shards]
+        self.shards = shards
+        assert len(shards) > 0, f"no shards found for split {split}"
+        if master_process:
+            print(f"found {len(shards)} shards for split {split}")
+        self.reset()
+
+    def reset(self):
+        # state, init at shard zero
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.current_position = self.B * self.T * self.process_rank
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position : self.current_position+B*T+1]
+        x = (buf[:-1]).view(B, T) # inputs
+        y = (buf[1:]).view(B, T) # targets
+        # advance the position in the tensor
+        self.current_position += B * T * self.num_processes
+        # if loading the next batch would be out of bounds, advance to next shard
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
+            self.current_position = B * T * self.process_rank
+        return x, y
+    
+
+# ⭐️ 对小批数据进行过拟合是确保训练 Pipeline 正确的关键，在业内，我们把它叫做 "Overfit a single batch"。如果你能让模型在这一小撮数据（比如只有 1~2 个样本）上把 Loss 降到接近 0，或者准确率达到 100%，就证明你的整个 Pipeline（流水线）是通的。
+# ⭐️ “先过拟合一小批，再征服星辰大海。” 只有确定模型有“死记硬背”的能力，我们才能去谈论它的“泛化”能力。
+
+max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+
+# simple launch:
+# python train_gpt2.py
+# DDP launch for e.g. 8 GPUs:
+# torchrun --standalone --nproc_per_node=8 train_gpt2.py
+
+# run the training loop
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+
+# set up DDP (distributed data parallel).
+# torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
+ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+if ddp:
+    # use of DDP atm demands CUDA, we set the device appropriately according to rank
+    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+else:
+    # vanilla, non-DDP run
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    # attempt to autodetect device
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    print(f"using device: {device}")
+
+# added after video, pytorch can be serious about it's device vs. device_type distinction
+device_type = "cuda" if device.startswith("cuda") else "cpu"
+
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
+
+enc = tiktoken.get_encoding("gpt2")
+
+model = GPT(GPTConfig(vocab_size=50304))
+model.to(device)
+# torch.Tensor（张量）：必须重新赋值，需要是 tensor = tensor.to(device)。
+# nn.Module（模型/层）：不需要重新赋值，需要 model.to(device)。
+# 当你写 optimizer = torch.optim.Adam(model.parameters()) 时，一定要先把 model.to('cuda')，再把模型参数传给优化器。如果先建优化器再移模型，优化器里记下的参数地址可能还是 CPU 上的，会导致报错。
+use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix
+if use_compile:
+    model = torch.compile(model)
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
+
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
+
+for step in range(max_steps):
+    model.train()
+    # 这行代码的作用是将模型设置为训练模式。
+    # 有些模型层（Layer）在“训练”和“推理（预测）”时的行为是完全不同的。最典型的例子有两个：
+    # Dropout 层：在训练时会随机“关掉”一部分神经元来防止过拟合；但在预测时，必须全部打开。
+    # Batch Normalization（批归一化）层：在训练时会计算当前 Batch 的均值和方差；但在预测时，会使用整个训练集累积下来的均值和方差。
+    optimizer.zero_grad()
+    # 这行代码的作用是把模型参数中缓存的梯度全部归零。
+    # 为什么要归零？在 PyTorch 中，梯度的计算有一个特殊的设定：梯度是累加的（Accumulative）。
+    # 当你调用 loss.backward() 时，新计算出的梯度会加到原有的梯度上，而不是替换掉它们。后果：如果你不手动归一化，第二步的梯度就会加上第一步的梯度，导致梯度数值越来越大，模型参数更新方向彻底乱套。
+    # 但有时候也会去做梯度累计，下面是小 batch 梯度和大 batch 梯度的作用：
+    # 小 Batch 的路径——“醉汉走路”：虽然它会左右晃荡（震荡），但这种震荡有时是好事。它能帮助模型跳出那些微小的“局部最小值”（Local Minima）或“鞍点”，因此泛化能力好。但因为样本少，这 2 个样本可能刚好是“特例”（比如都是生僻词或长句子）。计算出的梯度方向可能会偏移大部队的方向。
+    # 大 Batch 的路径——“高铁行驶”：路径非常直，非常稳。但由于它太稳了，一旦进入一个坑（局部最优解），它可能就直接停在那了，没有足够的随机性能让它跳出来。但样本多（比如 128 个），通过平均，那些极端的特例被抵消了。计算出的梯度更接近整个数据集的真实梯度方向。
+    loss_accum = 0.0
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        # added after video, this field is also used by the forward pass.
+        if ddp:
+            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+        loss.backward()
+        # loss 去做反向传播，计算梯度。
+        optimizer.step()
+        # 优化器根据梯度更新模型参数。
