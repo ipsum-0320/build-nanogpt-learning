@@ -1,3 +1,7 @@
+# 其它的开源数据集包括了：
+# - https://github.com/togethercomputer/RedPajama-Data。
+# - https://huggingface.co/spaces/HuggingFaceFW/blogpost-fineweb-v1
+# - https://github.com/huggingface/fineweb-2
 """
 FineWeb-Edu dataset (for srs pretraining)
 https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu

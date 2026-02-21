@@ -4,16 +4,8 @@ import time
 import inspect
 from dataclasses import dataclass
 import torch
-import numpy as np
 import torch.nn as nn
 from torch.nn import functional as F
-from hellaswag import render_example, iterate_examples
-
-def load_tokens(filename):
-    npt = np.load(filename)
-    npt = npt.astype(np.int32) # added after video
-    ptt = torch.tensor(npt, dtype=torch.long)
-    return ptt
 
 class CausalSelfAttention(nn.Module):
     # 这里完整的实现了因果注意力机制。
@@ -322,51 +314,6 @@ class GPT(nn.Module):
             # 在随机初始化权重参数的情况下，loss 应该就等于 1/V。
         return logits, loss
     
-    def configure_optimizers(self, weight_decay, learning_rate, device_type):
-        # start with all of the candidate parameters (that require grad)
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # 逻辑：首先拿到模型中所有的参数名（pn）和参数对象（p）。
-        # 筛选：只保留 requires_grad=True 的参数（即那些在训练中需要计算梯度并更新的参数，排除掉被冻结的层）。
-
-        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        # decay_params (维数 $\ge 2$)：包括：线性层的权重矩阵（2D）、Embedding 层（2D）。逻辑：这些矩阵很大，最容易导致过拟合，所以需要执行 weight_decay。
-        # nodecay_params (维数 $< 2$)：包括：所有偏置（Bias）（1D）、LayerNorm 的 $\gamma$ 和 $\beta$（1D）。逻辑：它们是用来控制归一化分布的。如果强迫 gamma 接近 0，会导致信号消失，模型反而练不动。因此这些参数不应该被强迫变小，因此设置衰减为 0。
-        optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
-        ]
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        # p.numel()：计算参数张量中的元素总数（例如 $768 \times 768$）。
-        if master_process:
-            print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-            print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-            # 在日志里清楚地看到，模型中有多少参数正在被“惩罚”，有多少在“自由生长”。
-        # Create AdamW optimizer and use the fused version if it is available
-        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        # inspect.signature(...): inspect 是 Python 的内置模块，用于“自省”（即查看代码自身的信息）。这一步是获取 AdamW 构造函数的所有参数签名。.parameters: 获取该函数所有参数的名称列表。
-        use_fused = fused_available and device_type == "cuda"
-        # fused 是 PyTorch 较新版本引入的优化。
-        # 原理：标准的 AdamW 会对每个参数跑一次内核循环。fused=True 会将多个操作合并为一个 CUDA 内核调用。
-        # 好处：在 NVIDIA GPU 上，这能带来 10%~20% 的训练加速。
-
-        # Fused AdamW 的核心思想是：“一次搬运，全部搞定。”它通过 CUDA 编写了一个专门的内核函数，能够一次性处理模型中的多个（甚至所有）参数。原理拆解：
-        # 多张量合并 (Multi-Tensor Apply)：
-        # Fused 模式不再是一个一个地处理张量，而是将所有待处理的张量指针（Pointer）列表一次性传给一个大型的 CUDA Kernel。
-        # 内存访问优化：
-        # 它在 GPU 内部实现了更高效的内存读取。由于只需要启动一次（或极少数次）内核，原本分散的、碎片化的显存访问变得更加连续和规范。
-        # 指令并行：
-        # 在同一个 GPU 线程块内，可以利用硬件特性同时更新多个参数，减少了 CPU 和 GPU 之间的通信频繁切换。
-        if master_process:
-            print(f"using fused AdamW: {use_fused}")
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
-        # 这里的参数来自于 GPT-3。
-        return optimizer
-    
     @classmethod
     # 这里的 @classmethod 装饰器用于将普通方法转换为类方法，核心作用的是绑定到类本身（而非类的实例），无需创建类的对象即可调用。
     def from_pretrained(cls, model_type):
@@ -442,6 +389,60 @@ class GPT(nn.Module):
 
         return model
     
+    def configure_optimizers(self, weight_decay, learning_rate, device_type):
+        # start with all of the candidate parameters (that require grad)
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # 逻辑：首先拿到模型中所有的参数名（pn）和参数对象（p）。
+        # 筛选：只保留 requires_grad=True 的参数（即那些在训练中需要计算梯度并更新的参数，排除掉被冻结的层）。
+
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        # decay_params (维数 $\ge 2$)：包括：线性层的权重矩阵（2D）、Embedding 层（2D）。逻辑：这些矩阵很大，最容易导致过拟合，所以需要执行 weight_decay。
+        # nodecay_params (维数 $< 2$)：包括：所有偏置（Bias）（1D）、LayerNorm 的 $\gamma$ 和 $\beta$（1D）。逻辑：它们是用来控制归一化分布的。如果强迫 gamma 接近 0，会导致信号消失，模型反而练不动。因此这些参数不应该被强迫变小，因此设置衰减为 0。
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        # p.numel()：计算参数张量中的元素总数（例如 $768 \times 768$）。
+        if master_process:
+            print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+            print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+            # 在日志里清楚地看到，模型中有多少参数正在被“惩罚”，有多少在“自由生长”。
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        # inspect.signature(...): inspect 是 Python 的内置模块，用于“自省”（即查看代码自身的信息）。这一步是获取 AdamW 构造函数的所有参数签名。.parameters: 获取该函数所有参数的名称列表。
+        use_fused = fused_available and device_type == "cuda"
+        # fused 是 PyTorch 较新版本引入的优化。
+        # 原理：标准的 AdamW 会对每个参数跑一次内核循环。fused=True 会将多个操作合并为一个 CUDA 内核调用。
+        # 好处：在 NVIDIA GPU 上，这能带来 10%~20% 的训练加速。
+
+        # Fused AdamW 的核心思想是：“一次搬运，全部搞定。”它通过 CUDA 编写了一个专门的内核函数，能够一次性处理模型中的多个（甚至所有）参数。原理拆解：
+        # 多张量合并 (Multi-Tensor Apply)：
+        # Fused 模式不再是一个一个地处理张量，而是将所有待处理的张量指针（Pointer）列表一次性传给一个大型的 CUDA Kernel。
+        # 内存访问优化：
+        # 它在 GPU 内部实现了更高效的内存读取。由于只需要启动一次（或极少数次）内核，原本分散的、碎片化的显存访问变得更加连续和规范。
+        # 指令并行：
+        # 在同一个 GPU 线程块内，可以利用硬件特性同时更新多个参数，减少了 CPU 和 GPU 之间的通信频繁切换。
+        if master_process:
+            print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        # 这里的参数来自于 GPT-3。
+        return optimizer
+    
+import tiktoken
+import numpy as np
+from ..hellaswag import render_example, iterate_examples
+
+def load_tokens(filename):
+    npt = np.load(filename)
+    npt = npt.astype(np.int32) # added after video
+    ptt = torch.tensor(npt, dtype=torch.long)
+    return ptt
 
 class DataLoaderLite:
     # 这里的 DataLoader 是自定义的，同时具备了 DataLoader 和 DataSet 的功能。
@@ -485,6 +486,8 @@ class DataLoaderLite:
         # state, init at shard zero
         self.current_shard = 0
         self.tokens = load_tokens(self.shards[self.current_shard])
+        # self.B * self.T * self.process_rank 这是为了考虑多多进程加载数据，可以看到数据会被分割成八份，以下面的形式进行多进程读取：
+        # GPU0 | GPU1 | GPU2 | GPU3 | GPU4 | GPU5 | GPU6 | GPU7 | GPU0 | GPU1 | GPU2 | GPU3 | GPU4 | GPU5 | ...
         self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(self):
@@ -502,30 +505,148 @@ class DataLoaderLite:
         return x, y
     
 
+# -----------------------------------------------------------------------------
+# helper function for HellaSwag eval
+# takes tokens, mask, and logits, returns the index of the completion with the lowest loss
+
+def get_most_likely_row(tokens, mask, logits):
+    # evaluate the autoregressive loss at all positions
+    shift_logits = (logits[..., :-1, :]).contiguous()
+    shift_tokens = (tokens[..., 1:]).contiguous()
+    flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+    flat_shift_tokens = shift_tokens.view(-1)
+    shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
+    shift_losses = shift_losses.view(tokens.size(0), -1)
+    # now get the average loss just for the completion region (where mask == 1), in each row
+    shift_mask = (mask[..., 1:]).contiguous() # we must shift mask, so we start at the last prompt token
+    masked_shift_losses = shift_losses * shift_mask
+    # sum and divide by the number of 1s in the mask
+    sum_loss = masked_shift_losses.sum(dim=1)
+    avg_loss = sum_loss / shift_mask.sum(dim=1)
+    # now we have a loss for each of the 4 completions
+    # the one with the lowest loss should be the most likely
+    pred_norm = avg_loss.argmin().item()
+    return pred_norm
+
 # ⭐️ 对小批数据进行过拟合是确保训练 Pipeline 正确的关键，在业内，我们把它叫做 "Overfit a single batch"。如果我们能让模型在这一小撮数据（比如只有 1~2 个样本）上把 Loss 降到接近 0，或者准确率达到 100%，就证明我们的整个 Pipeline（流水线）是通的。
 # ⭐️ “先过拟合一小批，再征服星辰大海。” 只有确定模型有“死记硬背”的能力，我们才能去谈论它的“泛化”能力。
 
-max_lr = 6e-4
-min_lr = max_lr * 0.1
-warmup_steps = 715
-max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
-def get_lr(it): # 带预热的余弦退火学习率调度策略
-    # 1) linear warmup for warmup_iters steps
-    # 线性预热阶段，这是为了防止模型在训练刚开始时，由于权重随机初始化导致梯度过大，直接把模型“跑飞”了。
-    if it < warmup_steps:
-        return max_lr * (it+1) / warmup_steps
-    # 2) if it > lr_decay_iters, return min learning rate
-    # 如果当前的迭代次数超过了设定的最大步数，学习率将不再下降，而是维持在一个极小的常数 min_lr。这通常是为了在训练最后阶段进行微调。
-    if it > max_steps:
-        return min_lr
-    # 3) in between, use cosine decay down to min learning rate
-    # 这是代码的核心，负责在预热结束后平滑地降低学习率，在训练后期，学习率下降速度变慢，能帮助模型在最优点附近进行精细搜索。
-    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
-    return min_lr + coeff * (max_lr - min_lr)
+# run the training loop
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+# 先简单介绍一下目前主流的分布式训练方案及其对应的实现。
+# 首先是技术维度，这是解决问题的逻辑手段。
+# DP (Data Parallel): 单进程多线程（老旧，基本废弃）。
+# DDP (Distributed Data Parallel): 多进程，每卡完整模型（主流标配）。
+# TP (Tensor Parallel): 拆分算子/矩阵（针对超宽层）。
+# PP (Pipeline Parallel): 拆分层/模型段（针对超深模型）。
+# ZeRO / FSDP: 参数分片（DDP 的进化版，解决了显存冗余）。
 
+# 然后是工具维度，这是我们写代码时真正调用的东西。我们可以把它们分成三个层级：
+# A. 底层引擎 (Engines)
+# 这些框架真正实现了 TP、PP 或复杂的显存优化算法。
+# DeepSpeed (Microsoft): 实现了 ZeRO 1/2/3、Offload、PP。
+# Megatron-LM (NVIDIA): 实现了极致性能的 TP 和 PP。
+# PyTorch 原生: 提供了 DDP 和 FSDP 两个核心类。FSDP 是 PyTorch 1.11 推出的原生分布式训练技术。我们可以把它看作是 PyTorch 官方版的 DeepSpeed ZeRO-3。
 
+# B. 启动器 (Launchers)
+# 负责把我们的代码分发到各个进程/机器。
+# torchrun: PyTorch 官方推荐的启动工具（处理环境变量、容错重启，启八个进程用来分布式训练在八卡 GPU 上）。
+# deepspeed (CLI): DeepSpeed 自带的启动器。
+
+# C. 高层封装/脚手架 (Wrappers/High-level)
+# 它们不发明算法，而是让我们更容易地切换不同的底层引擎。
+# Hugging Face Accelerate: 一个轻量级工具。我们写一份代码，通过配置文件就能决定是用 DDP、FSDP 还是 DeepSpeed。
+# PyTorch Lightning: 一个更重的框架。它定义了一套写代码的规范（如 training_step），通过参数 strategy="ddp" 或 "deepspeed" 自动帮我们调用底层逻辑。
+
+# 因为 Karpathy 主要实践的是 DDP，因此先介绍一下 DDP。
+# 在 PyTorch 的大规模训练中，DistributedDataParallel (DDP) 是目前的行业标配。它比早期的 DataParallel (DP) 更快、更稳定，且能够跨多台机器扩展。简单来说，DDP 的核心逻辑是：在每个 GPU 上启动一个进程，每个进程拥有模型的一个副本，独立计算梯度，最后通过高效的通信协议同步梯度。
+
+# DDP 的运行遵循以下几个关键步骤：
+# 模型副本 (Model Replicas): 在训练开始时，主进程将模型的初始参数广播到所有进程，确保起点一致。
+# 数据分发 (Data Partitioning): 使用 DistributedSampler 确保每个进程在每一轮迭代（epoch）中看到不同的数据子集。
+# 梯度同步 (Gradient Sync): 这是最关键的一步。DDP 使用 All-Reduce 算法。当进程计算完梯度后，它们会相互通信并取梯度的平均值。
+# 重叠计算与通信: DDP 不会等所有梯度算完才通信。它将参数分成多个“桶（Buckets）”，当某一部分梯度算完时，就立即开始后台通信，从而隐藏网络延迟。
+
+# 那么，是不是 DDP 条件下，每个进程中模型的参数每时每刻都一致？
+# 答案是，不是每时每刻都一致，但在最关键的时刻（前向传播和参数更新时）是一致的。在 DDP 的运行循环中，模型参数的状态经历了一个“从统一到分歧，再回归统一”的过程。我们可以把这个过程拆解开来看：
+# 1. 初始时刻：绝对一致在训练开始时（调用 DDP(model) 时），主进程（Rank 0）会将自己的参数状态 Broadcast（广播） 给所有其他进程。此时，所有进程的模型参数是 $100\%$ 镜像一致的。
+# 2. 前向传播 (Forward)：保持一致由于参数一致，且每个进程拿到的数据（虽然不同）都会经过相同的数学运算，此时各进程模型中的参数依然保持一致。
+# 3. 反向传播 (Backward)：分歧出现这是最关键的点。梯度（Gradients）： 每个进程计算的是自己那部分数据的梯度。因为数据不同，产生的梯度是不一样的。参数（Parameters）： 在这个阶段，参数本身还没变，依然是一致的。
+# 4. 梯度同步 (All-Reduce)：重合点当反向传播进行时，DDP 启动了 All-Reduce 通讯。它将所有进程的梯度累加并取平均值。结果： 每一个进程现在都拿到了完全相同的“平均梯度”。
+# 5. 优化器更新 (Optimizer Step)：回归一致当执行 optimizer.step() 时：每个进程都拿着那份相同的平均梯度去更新自己本地的参数。既然起点（参数）一样，步长和方向（平均梯度）也一样，那么更新后的结果（新参数）自然又是完全一致的了。
+
+# set up DDP (distributed data parallel).
+# torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
+# 这些环境变量（RANK, LOCAL_RANK, WORLD_SIZE）不是操作系统自带的，也不是你手动在 .bashrc 里写的，而是由 PyTorch 的启动器（Launcher） 自动注入的。
+# 通常你会使用命令 torchrun --nproc_per_node=8 train.py 启动程序，当执行 torchrun 时，它会做以下几件事：
+# 1. 分身：在后台启动 8 个完全相同的 train.py 进程。
+# 2. 发证：给每个进程通过“环境变量”塞入不同的编号。
+#  - RANK: 告诉这个进程你在全球（所有机器）是第几个。
+#  - LOCAL_RANK: 告诉这个进程你在当前这台机器上是第几个（用来绑定 GPU）。
+#  - WORLD_SIZE: 告诉进程总共有多少个分身在跑。
+# 3. 握手：代码中的 init_process_group 会根据这些环境变量，让这 8 个进程互相认识，建立起通信网络。
+
+ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+if ddp:
+    # use of DDP atm demands CUDA, we set the device appropriately according to rank
+    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+    init_process_group(backend='nccl')
+    # NCCL (发音为 "Nickel") 全称是 NVIDIA Collective Communications Library。它是 NVIDIA 开发的一个库，专门用于多 GPU 之间的高性能通信。
+    # 如果你的多张显卡想要互相传输数据（比如同步梯度），直接走 CPU 转发会非常慢。NCCL 能够绕过 CPU，利用 NVLink（显卡间的“高速公路”）或 PCIe 直接在 GPU 之间暴力传输数据。在 NVIDIA GPU 上进行深度学习分布式训练时，NCCL 是绝对的行业标准，速度远快于 gloo 或 mpi 后端。
+    # NLCC 做了下面几件事情：
+    # 1. 建立通信网（Rendezvous / 握手）。所有并行的进程（Rank 0, Rank 1...）会通过一个共同的地址（通常是环境变量中的 MASTER_ADDR 和 MASTER_PORT）互相打招呼。直到所有进程都到齐了，这个函数才会返回。如果有一个进程掉队，程序就会卡在这里直到超时。
+    # 2.  确认拓扑结构。NCCL 会自动侦测你机器上的硬件布局，哪些 GPU 之间有 NVLink？哪些是通过 PCIe 总线连接的？它会自动计算出一条最优的数据传输路径（比如采用 Ring-AllReduce 算法，让数据像接力赛一样在显卡间流转）。
+    # 3. 初始化通信缓冲区。在 GPU 显存中划出一块专门的区域，用于存放待发送和接收的梯度数据。
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    # 在多 GPU 训练中，虽然你启动了多个进程，但默认情况下，每个进程看到的第一块显卡都是 cuda:0。如果不通过这行代码明确指定，所有进程都会挤在第一张显卡上抢资源，导致显存溢出（OOM）或极低的运行效率。
+    # 这行代码告诉当前的 Python 进程：“从现在起，后续所有没有明确指定 ID 的 CUDA 操作，全部默认发送到这张卡上。”设定默认设备： 比如你执行 x = torch.randn(10).cuda()，PyTorch 就会把 x 放到你刚刚 set_device 指定的那张卡上。隔离进程： 在 DDP（分布式数据并行）中，每个进程负责一张卡。通过 ddp_local_rank（比如 0, 1, 2, 3），让进程 0 用卡 0，进程 1 用卡 1，实现物理上的并行。
+    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+else:
+    # vanilla, non-DDP run
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    # attempt to autodetect device
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    print(f"using device: {device}")
+
+# added after video, pytorch can be serious about it's device vs. device_type distinction
+device_type = "cuda" if device.startswith("cuda") else "cpu"
+
+# 因为这里的随机数种子固定，因此后续 GPT model 在多进程初始化的时候，
+# 其 model 的初始化权重参数也是完全一致的。
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
+
+enc = tiktoken.get_encoding("gpt2")
+
+total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
+# 这里的 total_batch_size 是 批次 * token 数，因此最终的结果是 token 数，而不是样本 batch size 的个数。
+B = 64 # micro batch size
+T = 1024 # sequence length
+assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
+# 这里为什么要 * ddp_world_size 是因为现在是多卡训练。
+grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+# 梯度累积。
+if master_process:
+    # 防止重复输出，只有主进程才会输出。
+    print(f"total desired batch size: {total_batch_size}")
+    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
+val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
 
 torch.set_float32_matmul_precision('high')
 # 允许 PyTorch 在进行矩阵乘法（MatMul）时，使用 TensorFloat-32 (TF32) 数据格式，从而在牺牲极小精度的情况下，大幅提升计算速度。
@@ -563,88 +684,6 @@ torch.set_float32_matmul_precision('high')
 # BF16 就像一个改造过的工业秤：它的量程极大（指数位多），虽然看不太准克数（尾数位少），但它绝不会因为数字太小而直接罢工，它总能给我们一个大概的数值。激进派：牺牲精度换范围。它认为在深度学习中，“能表示极小的梯度”比“表示得极其精确”更重要。
 
 
-# run the training loop
-from torch.distributed import init_process_group, destroy_process_group
-from torch.nn.parallel import DistributedDataParallel as DDP
-import torch.distributed as dist
-# 先简单介绍一下目前主流的分布式训练方案及其对应的实现。
-# 首先是技术维度，这是解决问题的逻辑手段。
-# DP (Data Parallel): 单进程多线程（老旧，基本废弃）。
-# DDP (Distributed Data Parallel): 多进程，每卡完整模型（主流标配）。
-# TP (Tensor Parallel): 拆分算子/矩阵（针对超宽层）。
-# PP (Pipeline Parallel): 拆分层/模型段（针对超深模型）。
-# ZeRO / FSDP: 参数分片（DDP 的进化版，解决了显存冗余）。
-
-# 然后是工具维度，这是我们写代码时真正调用的东西。我们可以把它们分成三个层级：
-# A. 底层引擎 (Engines)
-# 这些框架真正实现了 TP、PP 或复杂的显存优化算法。
-# DeepSpeed (Microsoft): 实现了 ZeRO 1/2/3、Offload、PP。
-# Megatron-LM (NVIDIA): 实现了极致性能的 TP 和 PP。
-# PyTorch 原生: 提供了 DDP 和 FSDP 两个核心类。FSDP 是 PyTorch 1.11 推出的原生分布式训练技术。我们可以把它看作是 PyTorch 官方版的 DeepSpeed ZeRO-3。
-
-# B. 启动器 (Launchers)
-# 负责把我们的代码分发到各个进程/机器。
-# torchrun: PyTorch 官方推荐的启动工具（处理环境变量、容错重启）。
-# deepspeed (CLI): DeepSpeed 自带的启动器。
-
-# C. 高层封装/脚手架 (Wrappers/High-level)
-# 它们不发明算法，而是让我们更容易地切换不同的底层引擎。
-# Hugging Face Accelerate: 一个轻量级工具。我们写一份代码，通过配置文件就能决定是用 DDP、FSDP 还是 DeepSpeed。
-# PyTorch Lightning: 一个更重的框架。它定义了一套写代码的规范（如 training_step），通过参数 strategy="ddp" 或 "deepspeed" 自动帮我们调用底层逻辑。
-
-# 因为 Karpathy 主要实践的是 DDP，因此先介绍一下 DDP。
-# 在 PyTorch 的大规模训练中，DistributedDataParallel (DDP) 是目前的行业标配。它比早期的 DataParallel (DP) 更快、更稳定，且能够跨多台机器扩展。简单来说，DDP 的核心逻辑是：在每个 GPU 上启动一个进程，每个进程拥有模型的一个副本，独立计算梯度，最后通过高效的通信协议同步梯度。
-
-# DDP 的运行遵循以下几个关键步骤：
-# 模型副本 (Model Replicas): 在训练开始时，主进程将模型的初始参数广播到所有进程，确保起点一致。
-# 数据分发 (Data Partitioning): 使用 DistributedSampler 确保每个进程在每一轮迭代（epoch）中看到不同的数据子集。
-# 梯度同步 (Gradient Sync): 这是最关键的一步。DDP 使用 All-Reduce 算法。当进程计算完梯度后，它们会相互通信并取梯度的平均值。
-# 重叠计算与通信: DDP 不会等所有梯度算完才通信。它将参数分成多个“桶（Buckets）”，当某一部分梯度算完时，就立即开始后台通信，从而隐藏网络延迟。
-
-# 那么，是不是 DDP 条件下，每个进程中模型的参数每时每刻都一致？
-# 答案是，不是每时每刻都一致，但在最关键的时刻（前向传播和参数更新时）是一致的。在 DDP 的运行循环中，模型参数的状态经历了一个“从统一到分歧，再回归统一”的过程。我们可以把这个过程拆解开来看：
-# 1. 初始时刻：绝对一致在训练开始时（调用 DDP(model) 时），主进程（Rank 0）会将自己的参数状态 Broadcast（广播） 给所有其他进程。此时，所有进程的模型参数是 $100\%$ 镜像一致的。
-# 2. 前向传播 (Forward)：保持一致由于参数一致，且每个进程拿到的数据（虽然不同）都会经过相同的数学运算，此时各进程模型中的参数依然保持一致。
-# 3. 反向传播 (Backward)：分歧出现这是最关键的点。梯度（Gradients）： 每个进程计算的是自己那部分数据的梯度。因为数据不同，产生的梯度是不一样的。参数（Parameters）： 在这个阶段，参数本身还没变，依然是一致的。
-# 4. 梯度同步 (All-Reduce)：重合点当反向传播进行时，DDP 启动了 All-Reduce 通讯。它将所有进程的梯度累加并取平均值。结果： 每一个进程现在都拿到了完全相同的“平均梯度”。
-# 5. 优化器更新 (Optimizer Step)：回归一致当执行 optimizer.step() 时：每个进程都拿着那份相同的平均梯度去更新自己本地的参数。既然起点（参数）一样，步长和方向（平均梯度）也一样，那么更新后的结果（新参数）自然又是完全一致的了。
-
-# set up DDP (distributed data parallel).
-# torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
-ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
-if ddp:
-    # use of DDP atm demands CUDA, we set the device appropriately according to rank
-    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
-    init_process_group(backend='nccl')
-    ddp_rank = int(os.environ['RANK'])
-    ddp_local_rank = int(os.environ['LOCAL_RANK'])
-    ddp_world_size = int(os.environ['WORLD_SIZE'])
-    device = f'cuda:{ddp_local_rank}'
-    torch.cuda.set_device(device)
-    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-else:
-    # vanilla, non-DDP run
-    ddp_rank = 0
-    ddp_local_rank = 0
-    ddp_world_size = 1
-    master_process = True
-    # attempt to autodetect device
-    device = "cpu"
-    if torch.cuda.is_available():
-        device = "cuda"
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = "mps"
-    print(f"using device: {device}")
-
-# added after video, pytorch can be serious about it's device vs. device_type distinction
-device_type = "cuda" if device.startswith("cuda") else "cpu"
-
-torch.manual_seed(1337)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed(1337)
-
-enc = tiktoken.get_encoding("gpt2")
-
 model = GPT(GPTConfig(vocab_size=50304))
 # 这里的 vocab_size 从 vocab_size: int = 50257 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token 改成 vocab_size=50304，为什么可以进一步加速训练？
 # 这是一个非常经典且硬核的工程优化问题。将 vocab_size 从 50257 增加到 50304，看似多加了 47 个无用的空 token，但实际上是为了满足现代 GPU 架构对内存对齐（Memory Alignment）和算力分配的偏好。
@@ -654,17 +693,6 @@ model = GPT(GPTConfig(vocab_size=50304))
 # 2. 解码层（Linear/Softmax）：它们被“无视”了在模型的最后一层，模型会为所有 50304 个 token 计算一个得分（Logit）。训练阶段：我们的训练数据（Label）里永远不会出现 ID 为 50257 的目标。当模型计算 Cross Entropy Loss 时，由于这些多出来的 token 永远不是“正确答案”，损失函数会不断告诉模型：“这个位置的概率应该是 0”。
 # 这种做法唯一的副作用是： 我们的模型权重文件（.bin 或 .safetensors）会因为多了这 47 个向量而变大那么几百 KB。但比起训练速度提升的 5%~10%，这点硬盘空间完全可以忽略不计。
 
-model = torch.compile(model)
-# torch.compile(model) 是一个非常重要的优化手段，标志着 PyTorch 从**即时执行（Eager Mode）向编译模式（Graph Mode）**的跨越。
-# torch.compile 的底层由三个核心技术支撑：
-
-# ① TorchDynamo (捕捉图)
-# 它使用 Python Frame Evaluation API 来拦截 Python 字节码。即使我们的模型里有复杂的 if-else 分支或第三方库调用，它也能通过“图追踪”把能加速的张量计算部分提取出来，形成一个 FX Graph。也就是说，它利用 TorchDynamo 像“探照灯”一样扫描我们的 Python 字节码，把一系列离散的算子打包成一个完整的计算图（Graph）。消除 Python 开销： 一旦图被捕获并编译成内核，执行时就不再需要 Python 解释器介入，直接在底层高性能运行。
-# ② AOTAutograd (处理反向传播)
-# 传统的 PyTorch 动态生成反向传播。torch.compile 则是“提前”（Ahead-Of-Time）生成反向传播的计算图，并将其纳入优化范围。
-# ③ OpenAI Triton (生成内核)
-# 这是最关键的一步。它将优化后的计算图转化为 Triton Kernels（一种类 CUDA 的高效编程语言）。算子融合 (Operator Fusion)： 这是提升速度的核心。例如，它能把 ReLU(Add(A, B)) 这三个原本需要三次内存读写的操作，合并成一个 CUDA Kernel。原本数据要回传到显存三次，现在只需一次。
-
 model.to(device)
 # torch.Tensor（张量）：必须重新赋值，需要是 tensor = tensor.to(device)。
 # nn.Module（模型/层）：不需要重新赋值，需要 model.to(device)。
@@ -672,25 +700,171 @@ model.to(device)
 use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix
 if use_compile:
     model = torch.compile(model)
+    # torch.compile(model) 是一个非常重要的优化手段，标志着 PyTorch 从**即时执行（Eager Mode）向编译模式（Graph Mode）**的跨越。
+    # torch.compile 的底层由三个核心技术支撑：
+
+    # ① TorchDynamo (捕捉图)
+    # 它使用 Python Frame Evaluation API 来拦截 Python 字节码。即使我们的模型里有复杂的 if-else 分支或第三方库调用，它也能通过“图追踪”把能加速的张量计算部分提取出来，形成一个 FX Graph。也就是说，它利用 TorchDynamo 像“探照灯”一样扫描我们的 Python 字节码，把一系列离散的算子打包成一个完整的计算图（Graph）。消除 Python 开销： 一旦图被捕获并编译成内核，执行时就不再需要 Python 解释器介入，直接在底层高性能运行。
+    # ② AOTAutograd (处理反向传播)
+    # 传统的 PyTorch 动态生成反向传播。torch.compile 则是“提前”（Ahead-Of-Time）生成反向传播的计算图，并将其纳入优化范围。
+    # ③ OpenAI Triton (生成内核)
+    # 这是最关键的一步。它将优化后的计算图转化为 Triton Kernels（一种类 CUDA 的高效编程语言）。算子融合 (Operator Fusion)： 这是提升速度的核心。例如，它能把 ReLU(Add(A, B)) 这三个原本需要三次内存读写的操作，合并成一个 CUDA Kernel。原本数据要回传到显存三次，现在只需一次。
 if ddp:
+    # DDP(model) 在前向传播时没有多大的影响，但是反向传播时会触发 all-reducer。
+    # 计算即触发：在 loss.backward() 执行期间，一旦某一个层的梯度（Gradient）计算完成了，这个钩子就会立刻被触发。
+    # 异步 All-Reduce：它不会等整棵树都算完才同步，而是在计算倒数第一层梯度的同时，就开始把倒数第二层的梯度通过 NCCL 往其他卡上发。这种**计算与通信重叠（Overlapping）**的策略，是大规模训练效率极高的原因。
     model = DDP(model, device_ids=[ddp_local_rank])
+    # DDP(model, ...)：多卡同步器
+    # 在做什么：把你的单机模型包装成一个“分布式版本”。
+    # 有什么用：
+    # - 梯度同步：当 loss.backward() 执行时，DDP 会自动触发我们在前面提到的 NCCL All-Reduce，把所有卡的梯度平均化。
+    # - 状态同步：确保训练开始前，所有卡的模型参数初始值完全一致。
+    # 关键参数 device_ids=[ddp_local_rank]：这行非常重要！它告诉 DDP 这一份进程只管这一块 GPU，避免了多个进程抢夺同一块卡。
 raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
+# 这是这段代码中最具智慧的一行，也是为了解决“模型嵌套”问题。
+# 问题的由来：一旦你用了 DDP 包装模型，你的原始模型就被套在了 DDP 对象的内部。原本你访问 model.transformer，现在必须访问 model.module.transformer。
+# 有什么用：
+# - 统一访问入口：无论你是在单卡跑（没加 DDP）还是多卡跑（加了 DDP），raw_model 永远指向那个纯净的、没有被包装的原始模型。
+# - 保存模型：当你保存 checkpoint 时，你肯定希望保存的是 raw_model.state_dict()。如果直接保存 model.state_dict()，权重键值对里会全是 module.xxx，这会导致你以后在单卡加载时报错。
+# 为什么要这么写：为了后续代码的整洁。无论环境怎么变，只要涉及到修改模型参数、保存模型、或者调用模型自定义方法，统一用 raw_model 就不会出错。
+
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 715
+max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+def get_lr(it): # 带预热的余弦退火学习率调度策略
+    # 1) linear warmup for warmup_iters steps
+    # 线性预热阶段，这是为了防止模型在训练刚开始时，由于权重随机初始化导致梯度过大，直接把模型“跑飞”了。
+    if it < warmup_steps:
+        return max_lr * (it+1) / warmup_steps
+    # 2) if it > lr_decay_iters, return min learning rate
+    # 如果当前的迭代次数超过了设定的最大步数，学习率将不再下降，而是维持在一个极小的常数 min_lr。这通常是为了在训练最后阶段进行微调。
+    if it > max_steps:
+        return min_lr
+    # 3) in between, use cosine decay down to min learning rate
+    # 这是代码的核心，负责在预热结束后平滑地降低学习率，在训练后期，学习率下降速度变慢，能帮助模型在最优点附近进行精细搜索。
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
+    return min_lr + coeff * (max_lr - min_lr)
 
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
 
-total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-B = 64 # micro batch size
-T = 1024 # sequence length
-assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
-grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
-if master_process:
-    print(f"total desired batch size: {total_batch_size}")
-    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
-
-train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
-val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
+# create the log directory we will write checkpoints to and log to
+log_dir = "log"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"log.txt")
+with open(log_file, "w") as f: # open for writing to clear the file
+    pass
 
 for step in range(max_steps):
+    t0 = time.time()
+    last_step = (step == max_steps - 1)
+
+
+    # once in a while evaluate our validation loss
+    if step % 250 == 0 or last_step:
+        model.eval()
+        val_loader.reset()
+        with torch.no_grad():
+            val_loss_accum = 0.0
+            val_loss_steps = 20
+            for _ in range(val_loss_steps):
+                x, y = val_loader.next_batch()
+                x, y = x.to(device), y.to(device)
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    logits, loss = model(x, y)
+                loss = loss / val_loss_steps
+                val_loss_accum += loss.detach()
+        if ddp:
+            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+        if master_process:
+            print(f"validation loss: {val_loss_accum.item():.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+            if step > 0 and (step % 5000 == 0 or last_step):
+                # optionally write model checkpoints
+                checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+                checkpoint = {
+                    'model': raw_model.state_dict(),
+                    'config': raw_model.config,
+                    'step': step,
+                    'val_loss': val_loss_accum.item()
+                }
+                # you might also want to add optimizer.state_dict() and
+                # rng seeds etc., if you wanted to more exactly resume training
+                torch.save(checkpoint, checkpoint_path)
+
+    
+    # once in a while evaluate hellaswag
+    if (step % 250 == 0 or last_step) and (not use_compile):
+        num_correct_norm = 0
+        num_total = 0
+        for i, example in enumerate(iterate_examples("val")):
+            # only process examples where i % ddp_world_size == ddp_rank
+            if i % ddp_world_size != ddp_rank:
+                continue
+            # render the example into tokens and labels
+            _, tokens, mask, label = render_example(example)
+            tokens = tokens.to(device)
+            mask = mask.to(device)
+            # get the logits
+            with torch.no_grad():
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    logits, loss = model(tokens)
+                pred_norm = get_most_likely_row(tokens, mask, logits)
+            num_total += 1
+            num_correct_norm += int(pred_norm == label)
+        # reduce the stats across all processes
+        if ddp:
+            num_total = torch.tensor(num_total, dtype=torch.long, device=device)
+            num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
+            dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
+            dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
+            num_total = num_total.item()
+            num_correct_norm = num_correct_norm.item()
+        acc_norm = num_correct_norm / num_total
+        if master_process:
+            print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} hella {acc_norm:.4f}\n")
+
+    # once in a while generate from the model (except step 0, which is noise)
+    if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile):
+        model.eval()
+        num_return_sequences = 4
+        max_length = 32
+        tokens = enc.encode("Hello, I'm a language model,")
+        tokens = torch.tensor(tokens, dtype=torch.long)
+        tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+        xgen = tokens.to(device)
+        sample_rng = torch.Generator(device=device)
+        sample_rng.manual_seed(42 + ddp_rank)
+        while xgen.size(1) < max_length:
+            # forward the model to get the logits
+            with torch.no_grad():
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    logits, loss = model(xgen) # (B, T, vocab_size)
+                # take the logits at the last position
+                logits = logits[:, -1, :] # (B, vocab_size)
+                # get the probabilities
+                probs = F.softmax(logits, dim=-1)
+                # do top-k sampling of 50 (huggingface pipeline default)
+                # topk_probs here becomes (5, 50), topk_indices is (5, 50)
+                topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+                # select a token from the top-k probabilities
+                # note: multinomial does not demand the input to sum to 1
+                ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # (B, 1)
+                # gather the corresponding indices
+                xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+                # append to the sequence
+                xgen = torch.cat((xgen, xcol), dim=1)
+        # print the generated text
+        for i in range(num_return_sequences):
+            tokens = xgen[i, :max_length].tolist()
+            decoded = enc.decode(tokens)
+            print(f"rank {ddp_rank} sample {i}: {decoded}")
+
     model.train()
     # 这行代码的作用是将模型设置为训练模式。
     # 有些模型层（Layer）在“训练”和“推理（预测）”时的行为是完全不同的。最典型的例子有两个：
@@ -703,13 +877,14 @@ for step in range(max_steps):
     # 但有时候也会去做梯度累计，下面是小 batch 梯度和大 batch 梯度的作用：
     # 小 Batch 的路径——“醉汉走路”：虽然它会左右晃荡（震荡），但这种震荡有时是好事。它能帮助模型跳出那些微小的“局部最小值”（Local Minima）或“鞍点”，因此泛化能力好。但因为样本少，这 2 个样本可能刚好是“特例”（比如都是生僻词或长句子）。计算出的梯度方向可能会偏移大部队的方向。
     # 大 Batch 的路径——“高铁行驶”：路径非常直，非常稳。但由于它太稳了，一旦进入一个坑（局部最优解），它可能就直接停在那了，没有足够的随机性能让它跳出来。但样本多（比如 128 个），通过平均，那些极端的特例被抵消了。计算出的梯度更接近整个数据集的真实梯度方向。
-    loss_accum = 0.0
-    # 
+    loss_accum = torch.tensor(0.0).to(device)
     for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
         # added after video, this field is also used by the forward pass.
         if ddp:
+            # 可以使用 model.no_sync() 这样的上下文管理器来阻止每一次 loss.backward() 都去同步梯度。
+            # 因为 loss.backward() 在梯度积累情况下，会不断累积梯度，但是我们不希望在梯度累积过程中也去同步，而是只是在 micro step 的最后一步才去做梯度同步（否则会严重拖慢训练速度），因此就需要找一个开关 (micro_step == grad_accum_steps - 1)，只有他为 true，我们才做同步，否则不同步，开关变量就是 ddp model 的 require_backward_grad_sync 属性。
             model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
             # 这段代码是实现**自动混合精度（Automatic Mixed Precision, AMP）**的核心。简单来说，它是让模型在保持准确率的同时，跑得更快、省更多显存。
@@ -721,7 +896,7 @@ for step in range(max_steps):
             # device_type：指定设备（如 'cuda' 或 'cpu'）。
             # dtype：指定使用的低精度类型（这里是 torch.bfloat16）。
             # 上下文管理器 (with)：它只在这个代码块内生效。一旦退出，系统会恢复到默认精度。
-            logits, loss = model(x, y)
+            _, loss = model(x, y)
         loss = loss / grad_accum_steps
         loss_accum += loss.detach()
         # 如果不 detach()：当我们执行 loss_accum += loss 时，PyTorch 会认为我们可能还要对 loss_accum 进行反向传播。为了能算导数，它会把产生这个 loss 的所有中间变量（激活值、权重指针等）都保留在显存里。
@@ -729,6 +904,17 @@ for step in range(max_steps):
         # detach() 的作用：它像一把剪刀，把 loss 这个值从复杂的计算图中剪下来。现在它只是一个单纯的、孤零零的数字（Tensor），不再关联任何模型参数，也不会占用额外的显存来保存中间状态。
         # .item() 也会剥离计算图，但是他还会从 GPU 2 CPU，而 detach() 则是只剥离计算图，然后还在 GPU 中。
         loss.backward() # loss 去做反向传播，计算梯度。
+        # 在 ddp 环境下，loss.backward() 是同步的还是异步的呢？
+        # 它是“重叠执行”的（计算与通信异步并行，但最终结果同步）。
+
+        # A. 从“通信过程”看：它是异步/重叠的
+        # 当你调用 loss.backward() 时，DDP 不会等梯度全部算完才开始同步。
+        # 立即触发：一旦某个参数（比如模型最后一层）的梯度算出来了，DDP 就会立即在后台启动该参数的 All-Reduce 通信（通过 NCCL）。
+        # 边算边传：在计算前几层梯度的同时，后几层的梯度已经在网线/总线上传输了。这种“重叠（Overlapping）”是 DDP 效率极高的原因。
+
+        # B. 从“代码执行”看：它是准同步的
+        # 虽然通信在后台异步发生，但当你这行 loss.backward() 执行完毕并跳到下一行时，PyTorch 会确保所有必要的通信已经完成。
+        # 这意味着，当代码运行到 loss.backward() 下一行时，你拿到的梯度已经是全集群平均后的结果了。
     
     # 上述过程在做梯度累积，有三个问题：
 
@@ -746,6 +932,16 @@ for step in range(max_steps):
     # 3. 梯度裁剪 clip_grad_norm_ 需要等量提高吗？
     # 不需要提高。因为我们在计算梯度之前已经通过 loss / grad_accum_steps 修正了分母，
     # 所以最终累积出来的梯度，物理意义上依然是一个“平均梯度”。
+    if ddp:
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+        # 这行代码的作用是什么？以及他是同步的还是异步的？
+        # dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG) 的效果是：让参与训练的所有进程（所有显卡）同步它们各自手中的 loss_accum 值，并取平均。因此 loss_accum 这个变量是会被同时读写的，他是在 in-place 替换的。
+        # 在 PyTorch 的分布式 API 中，dist.all_reduce 默认是 同步的（Synchronous / Blocking）。
+        # - 行为：当程序运行到这一行时，它会停下来（阻塞）。
+        # - 等待：它会等待所有其他进程都运行到它们各自的 all_reduce 这一行。
+        # - 释放：只有当所有卡都交换完数据并完成了平均值计算，程序才会继续向下执行下一行代码。
+        # - 注意：如果你希望它是异步的，需要加上 async_op=True，这样它会返回一个 handle，你可以先做别的，稍后再调用 handle.wait()。
+        
 
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     # 这行代码执行的是深度学习中非常关键的一个步骤：梯度裁剪（Gradient Clipping）。简单来说，它的作用是防止“梯度爆炸”，让模型训练更稳健。如果把模型训练比作下山，这行代码就像是给我们的鞋底加了防滑垫，防止我们步子迈得太大直接摔下山崖。
@@ -768,7 +964,19 @@ for step in range(max_steps):
         # 数据结构上：每个 param_group 都可以拥有独立的 lr。
         # 通过这个循环，我们把计算出的余弦退火学习率应用到了所有的参数组上，使它们步调一致。
     optimizer.step()
+    t1 = time.time()
+    dt = t1 - t0 # time difference in seconds
+    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
+    tokens_per_sec = tokens_processed / dt
+    if master_process:
+        print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+        with open(log_file, "a") as f:
+            f.write(f"{step} train {loss_accum.item():.6f}\n")
     # 优化器根据梯度更新模型参数。
     # torch.cuda.synchronize()
     # 这个方法会强制让 CPU 等待 GPU 完成当前排队的所有任务。
     # CPU 和 GPU 是异步执行的，当我们调用 model(inputs) 或 loss.backward() 时，Python（CPU）并不会等 GPU 算完，它只是把指令“扔”给 GPU 队列，然后立刻执行下一行代码。
+
+if ddp:
+    # 正常销毁 ddp 进程组。
+    destroy_process_group()
