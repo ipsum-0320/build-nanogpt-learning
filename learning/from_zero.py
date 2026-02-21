@@ -100,8 +100,21 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         # 必须是 view 和 transpose 配合起来，不能直接使用 view 实现 (B, nh, T, hs) 的效果，否则就行就像把不同人的手、脚、躯干随机拼凑成一个新的人，语义完全崩塌。
+        
+        # non-flash attention
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
+        # 1. 内存效率：从 $O(T^2)$ 到 $O(T)$。在被注释掉的代码中，att = (q @ k.transpose(-2, -1)) 会生成一个形状为 (B, nh, T, T) 的中间矩阵（Attention Matrix）。痛点：如果序列长度 $T=1024$，这个矩阵的大小就是 $1024 \times 1024$。随着 $T$ 的增加，显存占用呈指数级增长，很容易导致 OOM (Out of Memory)。优化：SDPA 内部通常集成了 FlashAttention 算法。它通过 Tiling（分块） 技术，在不显式存储整个 $T \times T$ 矩阵的情况下计算输出，将显存复杂度降低到了线性级别。
+        # 2. 算子融合（Operator Fusion。手动版本：涉及多次显存读写（矩阵乘法 $\rightarrow$ 掩码填充 $\rightarrow$ Softmax $\rightarrow$ 再次矩阵乘法）。每一行代码都是一个独立的 GPU Kernel 调用，数据需要在显存和寄存器之间反复搬运。SDPA 版本：这是一个融合算子（Fused Kernel）。它将缩放、掩码、Softmax 和加权求和全部封装在一个 CUDA Kernel 中完成。减少了内存带宽的开销，显著提升了执行速度。
+        # 3. 硬件级加速。SDPA 会根据你的硬件自动选择最优的底层实现：FlashAttention-2：针对 NVIDIA Ampere (A100) 及更现代的架构进行了高度优化。Memory-Efficient Attention：针对较旧的 GPU 架构。C++ / Triton 实现：确保在不同环境下都能跑出接近硬件极限的 TFLOPS。
 
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
+        # FlashAttention 最大的改动是它将矩阵拆分成小的 Block，在 SRAM（高速片上缓存）里循环计算。为了在内存受限的情况下计算 Softmax，它引入了特殊的在线 Softmax 算法（Online Softmax）。这种逻辑结构非常复杂，目前的通用编译器很难自动从普通的矩阵乘法代码推导出这种精妙的循环结构。
+        # 虽然 Flash Attention 的计算量（FLOPs）其实比传统方法略多（因为反向传播有重算），但它极大地减少了内存访问（Memory IO）。在现代 GPU 上，计算很便宜，搬运数据才是最贵的。
+
         # 它把我们之前准备好的 $Q, K, V$ 拿过来，算出单词两两之间的相关性（Attention Score），并根据这个相关性对 $V$（信息内容）进行加权求和。
         # is_causal=True（关键点），这是为了 “防止偷看答案”。在训练 GPT 这种生成模型时，第 5 个单词只能看到前 4 个单词的信息，不能看到第 6 个。设置这个参数后，函数会自动把未来的信息屏蔽掉。
         # Mask 矩阵是对一句话的 Mask，如下所示：
@@ -313,25 +326,45 @@ class GPT(nn.Module):
         # start with all of the candidate parameters (that require grad)
         param_dict = {pn: p for pn, p in self.named_parameters()}
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # 逻辑：首先拿到模型中所有的参数名（pn）和参数对象（p）。
+        # 筛选：只保留 requires_grad=True 的参数（即那些在训练中需要计算梯度并更新的参数，排除掉被冻结的层）。
+
         # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
         # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        # decay_params (维数 $\ge 2$)：包括：线性层的权重矩阵（2D）、Embedding 层（2D）。逻辑：这些矩阵很大，最容易导致过拟合，所以需要执行 weight_decay。
+        # nodecay_params (维数 $< 2$)：包括：所有偏置（Bias）（1D）、LayerNorm 的 $\gamma$ 和 $\beta$（1D）。逻辑：它们是用来控制归一化分布的。如果强迫 gamma 接近 0，会导致信号消失，模型反而练不动。因此这些参数不应该被强迫变小，因此设置衰减为 0。
         optim_groups = [
             {'params': decay_params, 'weight_decay': weight_decay},
             {'params': nodecay_params, 'weight_decay': 0.0}
         ]
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        # p.numel()：计算参数张量中的元素总数（例如 $768 \times 768$）。
         if master_process:
             print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
             print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+            # 在日志里清楚地看到，模型中有多少参数正在被“惩罚”，有多少在“自由生长”。
         # Create AdamW optimizer and use the fused version if it is available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        # inspect.signature(...): inspect 是 Python 的内置模块，用于“自省”（即查看代码自身的信息）。这一步是获取 AdamW 构造函数的所有参数签名。.parameters: 获取该函数所有参数的名称列表。
         use_fused = fused_available and device_type == "cuda"
+        # fused 是 PyTorch 较新版本引入的优化。
+        # 原理：标准的 AdamW 会对每个参数跑一次内核循环。fused=True 会将多个操作合并为一个 CUDA 内核调用。
+        # 好处：在 NVIDIA GPU 上，这能带来 10%~20% 的训练加速。
+
+        # Fused AdamW 的核心思想是：“一次搬运，全部搞定。”它通过 CUDA 编写了一个专门的内核函数，能够一次性处理模型中的多个（甚至所有）参数。原理拆解：
+        # 多张量合并 (Multi-Tensor Apply)：
+        # Fused 模式不再是一个一个地处理张量，而是将所有待处理的张量指针（Pointer）列表一次性传给一个大型的 CUDA Kernel。
+        # 内存访问优化：
+        # 它在 GPU 内部实现了更高效的内存读取。由于只需要启动一次（或极少数次）内核，原本分散的、碎片化的显存访问变得更加连续和规范。
+        # 指令并行：
+        # 在同一个 GPU 线程块内，可以利用硬件特性同时更新多个参数，减少了 CPU 和 GPU 之间的通信频繁切换。
         if master_process:
             print(f"using fused AdamW: {use_fused}")
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        # 这里的参数来自于 GPT-3。
         return optimizer
     
     @classmethod
@@ -472,17 +505,109 @@ class DataLoaderLite:
 # ⭐️ 对小批数据进行过拟合是确保训练 Pipeline 正确的关键，在业内，我们把它叫做 "Overfit a single batch"。如果你能让模型在这一小撮数据（比如只有 1~2 个样本）上把 Loss 降到接近 0，或者准确率达到 100%，就证明你的整个 Pipeline（流水线）是通的。
 # ⭐️ “先过拟合一小批，再征服星辰大海。” 只有确定模型有“死记硬背”的能力，我们才能去谈论它的“泛化”能力。
 
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 715
 max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+def get_lr(it): # 带预热的余弦退火学习率调度策略
+    # 1) linear warmup for warmup_iters steps
+    # 线性预热阶段，这是为了防止模型在训练刚开始时，由于权重随机初始化导致梯度过大，直接把模型“跑飞”了。
+    if it < warmup_steps:
+        return max_lr * (it+1) / warmup_steps
+    # 2) if it > lr_decay_iters, return min learning rate
+    # 如果当前的迭代次数超过了设定的最大步数，学习率将不再下降，而是维持在一个极小的常数 min_lr。这通常是为了在训练最后阶段进行微调。
+    if it > max_steps:
+        return min_lr
+    # 3) in between, use cosine decay down to min learning rate
+    # 这是代码的核心，负责在预热结束后平滑地降低学习率，在训练后期，学习率下降速度变慢，能帮助模型在最优点附近进行精细搜索。
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
+    return min_lr + coeff * (max_lr - min_lr)
 
-# simple launch:
-# python train_gpt2.py
-# DDP launch for e.g. 8 GPUs:
-# torchrun --standalone --nproc_per_node=8 train_gpt2.py
+
+
+torch.set_float32_matmul_precision('high')
+# 允许 PyTorch 在进行矩阵乘法（MatMul）时，使用 TensorFloat-32 (TF32) 数据格式，从而在牺牲极小精度的情况下，大幅提升计算速度。
+# 在传统的深度学习中，float32 (FP32) 是标准精度。FP32：精度高，但计算开销大。TF32：这是 NVIDIA 推出的一种中间格式。它结合了 FP32 的动态范围（指数位）和 FP16 的精度（尾数位）。当你设置 precision='high' 时，GPU 内部会将 FP32 的矩阵乘法通过 TF32 核心来运行。这就像是给计算做了一次“无损（或极低损）压缩”，硬件跑起来飞快。
+# 但是这只是计算变快了，实际的数据还是 fp32，因此通信成本还是比较高的。这正是 TF32 与 混合精度训练（Mixed Precision, FP16/BF16） 最大的区别。
+# torch.set_float32_matmul_precision('high') 确实是一个“内部转换”：
+# 输入/输出：依然是实打实的 32-bit (FP32) 占用。
+# 内存/显存：没有任何节省，权重和激活值在显存里还是占 4 字节。
+# 通信（Distributed）：多卡同步（All-Reduce）时，传的还是 FP32，带宽压力一点没减。
+# 计算：只有在 GPU 核心内部 做乘法那一瞬间，被转成了 TF32 处理。
+
+# 顺带在这里介绍下 fp32 tf32 fp16 bf16 的区别：
+# FP32 (Full Precision)
+# 结构：1位符号 + 8位指数 + 23位尾数。
+# 现状：它是所有深度学习的基准。如果你不差钱（显存够）也不差时间，用它永远最稳。
+
+# TF32 (TensorFloat-32)
+# 本质：它不是一种存储格式，而是一种运算模式。
+# 逻辑：它取了 FP32 的指数位（保证数值范围够大，不会溢出）和 FP16 的尾数位（保证计算速度快）。
+# 优势：在 RTX 30/40 或 A100 上，开启 matmul_precision('high') 后，原本 FP32 的矩阵乘法会自动走 TF32 单元，不需要改模型代码就能提速。
+
+# FP16 (Half Precision)
+# 挑战：它的指数位只有 5 位，最大能表示的数只有 65504。在训练深层网络时，梯度很容易超过这个值（上溢）或者变得太小（下溢）。
+# 对策：必须配合 torch.cuda.amp.GradScaler 使用，通过缩放梯度来防止数值消失或爆炸。
+
+# BF16 (Brain Floating Point)
+# 设计思路：由 Google Brain 提出。它直接把 FP32 的 23 位尾数截断成 7 位，保留完整的 8 位指数。
+# 优势：它和 FP32 拥有完全一样的数值范围。这意味着你不用做任何“梯度缩放”，模型就能跑得很稳，且显存和通信带宽比 FP32 省了一半。它是目前大模型（LLM）训练的首选。
+
+# 顺便介绍下如何理解指数和尾数：
+# 我们可以用科学计数法来完美类比。在数学中，科学计数法写做：$$1.234 \times 10^{5}$$在这个例子中：$1.234$ 就是尾数（Mantissa/Fraction）：它决定了数字的精度（也就是这把尺子的刻度有多细）。$5$ 就是指数（Exponent）：它决定了数字的范围（也就是这个数字能有多大或多小，小数点往哪挪）。计算机存储浮点数（FP32/FP16等）的原理一模一样，只不过底数从 $10$ 变成了 $2$。
+# 指数位决定了你能表示的数值边界。如果指数位多（如 FP32, BF16 有 8 位）：你可以表示极大的数（如 $2^{127}$）和极小的数（如 $2^{-126}$）。这就像你的手特别长，既能摸到天上的星星，也能摸到地上的尘埃。如果指数位少（如 FP16 只有 5 位）：你最大只能表示到 $2^{15}$（即 65504），最小只能到 $2^{-14}$。这就像你的手很短，太远的东西（大数）你摸不到（上溢），太小的微粒（小梯度）你也抓不住（下溢/变成0）。
+# 尾数位决定了你在某个范围内能分得多细。如果尾数位多（如 FP32 有 23 位）：在 $1.0$ 到 $2.0$ 之间，你可以切成 $2^{23}$（约 800 万）个小刻度。你能分辨出 $1.0000001$ 和 $1.0000002$ 的区别。如果尾数位少（如 BF16 只有 7 位）：在 $1.0$ 到 $2.0$ 之间，你只能切成 $2^{7}$（128）个刻度。如果你想表达 $1.0000001$，由于刻度太粗，它会直接被“四舍五入”成 $1.0$。
+# FP16 就像一个珠宝秤：它很精确（尾数位多），但量程很小（指数位少）。如果你放个秤砣（大梯度），它就爆了；如果你放粒灰尘（小梯度），它可能也感觉不到。
+# BF16 就像一个改造过的工业秤：它的量程极大（指数位多），虽然看不太准克数（尾数位少），但它绝不会因为数字太小而直接罢工，它总能给你一个大概的数值。激进派：牺牲精度换范围。它认为在深度学习中，“能表示极小的梯度”比“表示得极其精确”更重要。
+
 
 # run the training loop
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
+# 先简单介绍一下目前主流的分布式训练方案及其对应的实现。
+# 首先是技术维度，这是解决问题的逻辑手段。
+# DP (Data Parallel): 单进程多线程（老旧，基本废弃）。
+# DDP (Distributed Data Parallel): 多进程，每卡完整模型（主流标配）。
+# TP (Tensor Parallel): 拆分算子/矩阵（针对超宽层）。
+# PP (Pipeline Parallel): 拆分层/模型段（针对超深模型）。
+# ZeRO / FSDP: 参数分片（DDP 的进化版，解决了显存冗余）。
+
+# 然后是工具维度，这是你写代码时真正调用的东西。我们可以把它们分成三个层级：
+# A. 底层引擎 (Engines)
+# 这些框架真正实现了 TP、PP 或复杂的显存优化算法。
+# DeepSpeed (Microsoft): 实现了 ZeRO 1/2/3、Offload、PP。
+# Megatron-LM (NVIDIA): 实现了极致性能的 TP 和 PP。
+# PyTorch 原生: 提供了 DDP 和 FSDP 两个核心类。FSDP 是 PyTorch 1.11 推出的原生分布式训练技术。你可以把它看作是 PyTorch 官方版的 DeepSpeed ZeRO-3。
+
+# B. 启动器 (Launchers)
+# 负责把你的代码分发到各个进程/机器。
+# torchrun: PyTorch 官方推荐的启动工具（处理环境变量、容错重启）。
+# deepspeed (CLI): DeepSpeed 自带的启动器。
+
+# C. 高层封装/脚手架 (Wrappers/High-level)
+# 它们不发明算法，而是让你更容易地切换不同的底层引擎。
+# Hugging Face Accelerate: 一个轻量级工具。你写一份代码，通过配置文件就能决定是用 DDP、FSDP 还是 DeepSpeed。
+# PyTorch Lightning: 一个更重的框架。它定义了一套写代码的规范（如 training_step），通过参数 strategy="ddp" 或 "deepspeed" 自动帮你调用底层逻辑。
+
+# 因为 Karpathy 主要实践的是 DDP，因此先介绍一下 DDP。
+# 在 PyTorch 的大规模训练中，DistributedDataParallel (DDP) 是目前的行业标配。它比早期的 DataParallel (DP) 更快、更稳定，且能够跨多台机器扩展。简单来说，DDP 的核心逻辑是：在每个 GPU 上启动一个进程，每个进程拥有模型的一个副本，独立计算梯度，最后通过高效的通信协议同步梯度。
+
+# DDP 的运行遵循以下几个关键步骤：
+# 模型副本 (Model Replicas): 在训练开始时，主进程将模型的初始参数广播到所有进程，确保起点一致。
+# 数据分发 (Data Partitioning): 使用 DistributedSampler 确保每个进程在每一轮迭代（epoch）中看到不同的数据子集。
+# 梯度同步 (Gradient Sync): 这是最关键的一步。DDP 使用 All-Reduce 算法。当进程计算完梯度后，它们会相互通信并取梯度的平均值。
+# 重叠计算与通信: DDP 不会等所有梯度算完才通信。它将参数分成多个“桶（Buckets）”，当某一部分梯度算完时，就立即开始后台通信，从而隐藏网络延迟。
+
+# 那么，是不是 DDP 条件下，每个进程中模型的参数每时每刻都一致？
+# 答案是，不是每时每刻都一致，但在最关键的时刻（前向传播和参数更新时）是一致的。在 DDP 的运行循环中，模型参数的状态经历了一个“从统一到分歧，再回归统一”的过程。我们可以把这个过程拆解开来看：
+# 1. 初始时刻：绝对一致在训练开始时（调用 DDP(model) 时），主进程（Rank 0）会将自己的参数状态 Broadcast（广播） 给所有其他进程。此时，所有进程的模型参数是 $100\%$ 镜像一致的。
+# 2. 前向传播 (Forward)：保持一致由于参数一致，且每个进程拿到的数据（虽然不同）都会经过相同的数学运算，此时各进程模型中的参数依然保持一致。
+# 3. 反向传播 (Backward)：分歧出现这是最关键的点。梯度（Gradients）： 每个进程计算的是自己那部分数据的梯度。因为数据不同，产生的梯度是不一样的。参数（Parameters）： 在这个阶段，参数本身还没变，依然是一致的。
+# 4. 梯度同步 (All-Reduce)：重合点当反向传播进行时，DDP 启动了 All-Reduce 通讯。它将所有进程的梯度累加并取平均值。结果： 每一个进程现在都拿到了完全相同的“平均梯度”。
+# 5. 优化器更新 (Optimizer Step)：回归一致当执行 optimizer.step() 时：每个进程都拿着那份相同的平均梯度去更新自己本地的参数。既然起点（参数）一样，步长和方向（平均梯度）也一样，那么更新后的结果（新参数）自然又是完全一致的了。
 
 # set up DDP (distributed data parallel).
 # torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
@@ -521,6 +646,25 @@ if torch.cuda.is_available():
 enc = tiktoken.get_encoding("gpt2")
 
 model = GPT(GPTConfig(vocab_size=50304))
+# 这里的 vocab_size 从 vocab_size: int = 50257 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token 改成 vocab_size=50304，为什么可以进一步加速训练？
+# 这是一个非常经典且硬核的工程优化问题。将 vocab_size 从 50257 增加到 50304，看似多加了 47 个无用的空 token，但实际上是为了满足现代 GPU 架构对内存对齐（Memory Alignment）和算力分配的偏好。
+# 核心是因为 50304 满足“8 的倍数”原则。现代 GPU（尤其是 NVIDIA 的 Ampere、Hopper 架构）在进行矩阵乘法时，使用 Tensor Cores 进行加速。硬件偏好：Tensor Cores 在处理维度是 8、16、32 或 64 的倍数 的矩阵时效率最高。计算效率：50257 是一个素数（且是奇数），无法被 8 整除。而 $50304 = 128 \times 393$。结果：当维度对齐到 128 的倍数时，GPU 可以启用更高效的 CUDA Kernel，减少指令周期，避免处理边缘情况（Padding logic）带来的额外开销。
+# 由此带来的一个问题是，词表嵌入和分类头共享了权重参数，二者都不会关注多出来的 token 吗？
+# 1. 嵌入层（Embedding）：它们被锁在了“门外”嵌入层本质上是一个查表操作（Lookup Table）。输入限制：你的分词器（Tokenizer）是模型唯一的“守门人”。如果 Tokenizer 的词表大小是 50257，那么它输出给模型的 ID 永远只会在 $0$ 到 $50256$ 之间。结果：索引 $50257$ 到 $50303$ 的那些权重行，永远不会被索引到。在每一轮前向传播中，这些多出来的权重根本没机会进入模型的主体计算流程。
+# 2. 解码层（Linear/Softmax）：它们被“无视”了在模型的最后一层，模型会为所有 50304 个 token 计算一个得分（Logit）。训练阶段：你的训练数据（Label）里永远不会出现 ID 为 50257 的目标。当模型计算 Cross Entropy Loss 时，由于这些多出来的 token 永远不是“正确答案”，损失函数会不断告诉模型：“这个位置的概率应该是 0”。
+# 这种做法唯一的副作用是： 你的模型权重文件（.bin 或 .safetensors）会因为多了这 47 个向量而变大那么几百 KB。但比起训练速度提升的 5%~10%，这点硬盘空间完全可以忽略不计。
+
+model = torch.compile(model)
+# torch.compile(model) 是一个非常重要的优化手段，标志着 PyTorch 从**即时执行（Eager Mode）向编译模式（Graph Mode）**的跨越。
+# torch.compile 的底层由三个核心技术支撑：
+
+# ① TorchDynamo (捕捉图)
+# 它使用 Python Frame Evaluation API 来拦截 Python 字节码。即使你的模型里有复杂的 if-else 分支或第三方库调用，它也能通过“图追踪”把能加速的张量计算部分提取出来，形成一个 FX Graph。也就是说，它利用 TorchDynamo 像“探照灯”一样扫描你的 Python 字节码，把一系列离散的算子打包成一个完整的计算图（Graph）。消除 Python 开销： 一旦图被捕获并编译成内核，执行时就不再需要 Python 解释器介入，直接在底层高性能运行。
+# ② AOTAutograd (处理反向传播)
+# 传统的 PyTorch 动态生成反向传播。torch.compile 则是“提前”（Ahead-Of-Time）生成反向传播的计算图，并将其纳入优化范围。
+# ③ OpenAI Triton (生成内核)
+# 这是最关键的一步。它将优化后的计算图转化为 Triton Kernels（一种类 CUDA 的高效编程语言）。算子融合 (Operator Fusion)： 这是提升速度的核心。例如，它能把 ReLU(Add(A, B)) 这三个原本需要三次内存读写的操作，合并成一个 CUDA Kernel。原本数据要回传到显存三次，现在只需一次。
+
 model.to(device)
 # torch.Tensor（张量）：必须重新赋值，需要是 tensor = tensor.to(device)。
 # nn.Module（模型/层）：不需要重新赋值，需要 model.to(device)。
@@ -533,6 +677,18 @@ if ddp:
 raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
+
+total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
+B = 64 # micro batch size
+T = 1024 # sequence length
+assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
+grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+if master_process:
+    print(f"total desired batch size: {total_batch_size}")
+    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
+val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
 
 for step in range(max_steps):
     model.train()
@@ -548,6 +704,7 @@ for step in range(max_steps):
     # 小 Batch 的路径——“醉汉走路”：虽然它会左右晃荡（震荡），但这种震荡有时是好事。它能帮助模型跳出那些微小的“局部最小值”（Local Minima）或“鞍点”，因此泛化能力好。但因为样本少，这 2 个样本可能刚好是“特例”（比如都是生僻词或长句子）。计算出的梯度方向可能会偏移大部队的方向。
     # 大 Batch 的路径——“高铁行驶”：路径非常直，非常稳。但由于它太稳了，一旦进入一个坑（局部最优解），它可能就直接停在那了，没有足够的随机性能让它跳出来。但样本多（比如 128 个），通过平均，那些极端的特例被抵消了。计算出的梯度更接近整个数据集的真实梯度方向。
     loss_accum = 0.0
+    # 
     for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
@@ -555,10 +712,63 @@ for step in range(max_steps):
         if ddp:
             model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+            # 这段代码是实现**自动混合精度（Automatic Mixed Precision, AMP）**的核心。简单来说，它是让模型在保持准确率的同时，跑得更快、省更多显存。
+            # 通常情况下，深度学习模型使用 FP32（单精度浮点数，32位）进行计算。混合精度则是指在训练过程中，同时使用 FP32 和 FP16/BF16（半精度，16位）。FP32： 精度高，范围广，但计算慢，占用显存多；BF16/FP16： 精度较低，但计算速度极快（通常是 FP32 的数倍），占用显存减半。如果使用了 FP16 需要用 torch.cuda.amp.GradScaler()。
+            # torch.autocast 的原理本质上是**“各司其职”**，自动切换，它会自动检测神经网络中的操作。
+            # 对于计算密集型的操作（如矩阵乘法 Linear、卷积 Conv），它会将数据转为 BF16，利用 GPU 的 Tensor Cores 加速。
+            # 对于对精度敏感的操作（如 Softmax、Loss 计算、LayerNorm），它会保持使用 FP32 以确保数值稳定性。
+            # 权重更新： 虽然前向传播和反向传播可能使用低精度，但主权重（Master Weights）通常以 FP32 存储，以防止梯度更新时的微小变化被“舍入”掉。
+            # device_type：指定设备（如 'cuda' 或 'cpu'）。
+            # dtype：指定使用的低精度类型（这里是 torch.bfloat16）。
+            # 上下文管理器 (with)：它只在这个代码块内生效。一旦退出，系统会恢复到默认精度。
             logits, loss = model(x, y)
         loss = loss / grad_accum_steps
         loss_accum += loss.detach()
-        loss.backward()
-        # loss 去做反向传播，计算梯度。
-        optimizer.step()
-        # 优化器根据梯度更新模型参数。
+        # 如果不 detach()：当你执行 loss_accum += loss 时，PyTorch 会认为你可能还要对 loss_accum 进行反向传播。为了能算导数，它会把产生这个 loss 的所有中间变量（激活值、权重指针等）都保留在显存里。
+        # 后果：随着循环进行（比如累积 64 步），显存会像滚雪球一样迅速堆积，直到 OOM（显存溢出）。
+        # detach() 的作用：它像一把剪刀，把 loss 这个值从复杂的计算图中剪下来。现在它只是一个单纯的、孤零零的数字（Tensor），不再关联任何模型参数，也不会占用额外的显存来保存中间状态。
+        # .item() 也会剥离计算图，但是他还会从 GPU 2 CPU，而 detach() 则是只剥离计算图，然后还在 GPU 中。
+        loss.backward() # loss 去做反向传播，计算梯度。
+    
+    # 上述过程在做梯度累积，有三个问题：
+
+    # 1. 为什么要梯度累积？大 Batch Size 有什么好处？
+    # 简单来说，梯度累积是为了在显存有限的情况下，“伪装”出大 Batch Size 的效果。
+    # 数值稳定性（更准的梯度）。小 Batch 抽取的样本太少，产生的梯度随机性很大（噪声多）。大 Batch Size 相当于在一次更新前看了更多数据，计算出的梯度方向更接近整个数据集的真实梯度方向，训练曲线更平滑。
+    # 收敛速度。在很多现代架构（如 Transformer）中，较大的 Batch Size 配合适当调高的学习率，通常能让模型更快收敛，并达到更好的泛化效果。
+    # 硬件效率。GPU 的并行计算能力非常强。如果 Batch 太小，GPU 还没发力任务就结束了，导致利用率低。大 Batch 能填满 GPU 的计算单元，提高吞吐量（Tokens/sec）。
+
+    # 2. 为什么 loss = loss / grad_accum_steps？
+    # 其实简单来说，就是因为分母没有变。想象你在算全班 64 人的平均分，但你手里的表格一次只能填 8 个人：
+    # 错误做法：算出每 8 个人的平均分，然后把这 8 个平均分直接加起来。（结果会比真实平均分大 8 倍）
+    # 正确做法：算出每 8 个人的平均分，先除以 8，再把它们加起来。（这就得到了全班的真实平均分）
+
+    # 3. 梯度裁剪 clip_grad_norm_ 需要等量提高吗？
+    # 不需要提高。因为你在计算梯度之前已经通过 loss / grad_accum_steps 修正了分母，
+    # 所以最终累积出来的梯度，物理意义上依然是一个“平均梯度”。
+
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    # 这行代码执行的是深度学习中非常关键的一个步骤：梯度裁剪（Gradient Clipping）。简单来说，它的作用是防止“梯度爆炸”，让模型训练更稳健。如果把模型训练比作下山，这行代码就像是给你的鞋底加了防滑垫，防止你步子迈得太大直接摔下山崖。
+    # torch.nn.utils.clip_grad_norm_ 的工作流程如下：
+    # 计算总范数（Total Norm）：它会把模型中所有参数的梯度当成一个巨大的向量，计算这个向量的 $L_2$ 范数（即长度）。对所有参数求和（计算范数），是为了把整个模型看作一个不可分割的整体。这保证了在遭遇“梯度爆炸”需要刹车时，我们是均匀地踩下四个轮子的刹车（等比例缩放），而不是只锁死其中一个轮子（导致赛车甩尾失控）。
+    # 判断是否超标：你设置的第二个参数 1.0 就是你的“阈值”（max_norm）。如果 Total Norm <= 1.0：梯度保持不变，原样通过。如果 Total Norm > 1.0：它会把所有梯度等比例缩小，使得缩放后的总范数正好等于 1.0。
+    # 原地修改：函数名末尾的下划线 _ 表示这是一个 inplace 操作，它会直接修改 model.parameters() 里的 .grad 属性。
+    # 这个 norm 返回的是裁剪之前梯度的原始总范数。如果 norm 经常远大于 1.0，说明你的模型训练非常不稳定。如果 norm 变成 NaN 或 Inf，说明你的训练已经崩了。很多开发者会把这个 norm 记录到 TensorBoard 或 WandB 中，作为判断模型收敛状态的“体温计”。
+
+    # 如果你在 TensorBoard 上观察 grad_norm，模型训练正常的话：
+    # 初期：像心电图一样剧烈抖动，数值很高。
+    # 中期：抖动幅度收窄，整体趋势向右下方倾斜，但保留一定的“毛刺”（代表模型仍在对不同数据产生反应）。
+    # 后期：数值变得很小且非常平稳，说明模型已经“吃饱了”，再怎么训练也难有大改进。
+
+    # grad_norm 本质上就是梯度的宏观表现。只要这个值：不是 0（说明还在学）；不是 NaN（说明没崩）；正在慢慢变小（说明在变强）。那你的训练就是在通往成功的路上。
+    # 把 grad_norm 看作**“优化空间的剩余量”**是非常天才的视角。在实际大模型训练中，很多资深算法工程师甚至不看 Loss（因为 Loss 受到数据难度影响很大），而是盯着 grad_norm 看。只要它在稳步下降，大家就敢放心去睡觉；如果它突然“诈尸”跳高，那就是要出事的预兆。
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+        # 数据结构上：每个 param_group 都可以拥有独立的 lr。
+        # 通过这个循环，你把计算出的余弦退火学习率应用到了所有的参数组上，使它们步调一致。
+    optimizer.step()
+    # 优化器根据梯度更新模型参数。
+    # torch.cuda.synchronize()
+    # 这个方法会强制让 CPU 等待 GPU 完成当前排队的所有任务。
+    # CPU 和 GPU 是异步执行的，当你调用 model(inputs) 或 loss.backward() 时，Python（CPU）并不会等 GPU 算完，它只是把指令“扔”给 GPU 队列，然后立刻执行下一行代码。
