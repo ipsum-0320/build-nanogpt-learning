@@ -75,8 +75,8 @@ def write_datafile(filename, tokens_np):
 nprocs = max(1, os.cpu_count()//2)
 # 使用一半的 CPU 核心进行并行分词
 with mp.Pool(nprocs) as pool:
-    # 它创建了一个“进程池”，让你的电脑能够同时利用多个 CPU 核心来处理数据，而不是排队一个一个来。
-    # Pool(nprocs): 这是一个“员工池”。nprocs（通常是你 CPU 核心数的一半）代表池子里有多少个“员工”在待命。
+    # 它创建了一个“进程池”，让我们的电脑能够同时利用多个 CPU 核心来处理数据，而不是排队一个一个来。
+    # Pool(nprocs): 这是一个“员工池”。nprocs（通常是我们 CPU 核心数的一半）代表池子里有多少个“员工”在待命。
     # with ... as pool: 这是一个上下文管理器。它保证了任务干完后，这些“员工”会被自动遣散（释放内存和资源），不会常驻后台占用系统资源。
     shard_index = 0
     # preallocate buffer to hold current shard

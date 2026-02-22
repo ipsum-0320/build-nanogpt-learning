@@ -538,7 +538,7 @@ class DataLoaderLite:
     # - End-of-Sequence (EOS) 标记： SFT 必须让模型学会什么时候该“闭嘴”。如果句子被强制切断而没有出现 <|endoftext|>，模型就永远学不会在正确的地方停止输出。
 
     # 因此我们需要保证 SFT 的 Prompt + Response 结构是完整的，主要的解决方案有如下：
-    # 1. Padding（简单但低效）。最直观的方法是，给每个样本一个固定的 $T$（比如 2048）。做法： 短句子后面全部补 [PAD] 字符。问题： 如果你的数据集里大部分是短对话（比如 100 token），但你为了兼容长对话设置了 $T=2048$，那么 GPU 显存里 95% 的计算量都在算无意义的 [PAD]。这简直是在烧钱。
+    # 1. Padding（简单但低效）。最直观的方法是，给每个样本一个固定的 $T$（比如 2048）。做法： 短句子后面全部补 [PAD] 字符。问题： 如果我们的数据集里大部分是短对话（比如 100 token），但我们为了兼容长对话设置了 $T=2048$，那么 GPU 显存里 95% 的计算量都在算无意义的 [PAD]。这简直是在烧钱。
     # 2. packing + Block Diagonal Mask（主流高效）。为了不浪费显存，我们会把多个短样本（S1, S2, S3...）像挤公交车一样，“塞”进同一个长度为 $T$ 的向量里。但是！ 我们必须防止“语义污染”：S2 的开头不能看到 S1 的结尾。
     #   - 核心技术 1：Block Diagonal Mask（块对角掩码）
     #   通过定制 Attention Mask，让模型在计算注意力时，眼睛只盯着同一个样本内部。
@@ -546,21 +546,21 @@ class DataLoaderLite:
     #   样本 2 的第一个 token 即使在物理位置上紧挨着样本 1，但在计算时，Mask 会让它“看不见”样本 1。
     #   - 核心技术 2：Flash Attention 的 VarLen 模式
     #   这是目前最硬核的工程实现。传统的 Transformer 需要把数据 Padding 成规整的方阵（Rectangle），而 FlashAttention-2 提供了一个 varlen 接口：
-    #   你传入一个一维的长向量（包含所有样本）。
+    #   我们传入一个一维的长向量（包含所有样本）。
     #   再传入一个 cu_seqlens（累积序列长度）数组（例如 [0, 50, 120, 200]，表示第一个样本 50 长，第二个 70 长...）。
     #   结果： GPU 底层会直接跳过 Padding 部分，只在有效区域内算 Attention。既保证了不互相干扰（连贯性），又实现了 100% 的计算利用率。
 
     # 这里要重点介绍一下 FlashAttention 的 VarLen 范式。
-    # 在没有 VarLen 之前，即使你把多个样本 Pack 到一起，Transformer 仍然会把它看作一个长度为 $T$ 的单一序列。
-    # - 传统做法： 传入一个 $[B, T, D]$ 的张量。如果你想隔离样本，必须传一个巨大的 $T \times T$ 的 Mask 矩阵。GPU 依然要对 Mask 中为 0（被遮掩）的部分进行计算（虽然结果会被丢弃），这浪费了大量的显存带宽和算子执行时间。
-    # - VarLen 实现： 它直接打破了“矩形”限制。它告诉 GPU：“别管什么 Batch Size 和固定长度了，我给你一个一维的长向量，以及一份索引名单，你按名单在对应的区间里算 Attention 就行。”
+    # 在没有 VarLen 之前，即使我们把多个样本 Pack 到一起，Transformer 仍然会把它看作一个长度为 $T$ 的单一序列。
+    # - 传统做法： 传入一个 $[B, T, D]$ 的张量。如果我们想隔离样本，必须传一个巨大的 $T \times T$ 的 Mask 矩阵。GPU 依然要对 Mask 中为 0（被遮掩）的部分进行计算（虽然结果会被丢弃），这浪费了大量的显存带宽和算子执行时间。
+    # - VarLen 实现： 它直接打破了“矩形”限制。它告诉 GPU：“别管什么 Batch Size 和固定长度了，我给我们一个一维的长向量，以及一份索引名单，我们按名单在对应的区间里算 Attention 就行。”
 
     # 在 FlashAttention 的 VarLen 模式下，逻辑上的 $(B, T, D)$ 确实在物理内存上被“摊平”成了 $(\sum L, D)$（其中 $\sum L = B \times T$）。
     # 传统模型： 像一个规整的长方体。即便某个样本很短，它也要占据 $T$ 那么长的坑位。形状：[Batch, SeqLen, Num_Heads, Head_Dim]FlashAttention VarLen： 像一根长短不一的香肠连在一起。形状：[Total_Tokens, Num_Heads, Head_Dim]这里 Total_Tokens 就是该 Batch 中所有有效 token 的总和。
     # 在 FlashAttention 的 VarLen 实现里 => 物理存储： 确实是把 $B$ 和 $T$ 压扁成了一维。逻辑处理： 放弃了固定的 $T$ 步长，改用 cu_seqlens 指向的动态步长。
     # 最重要的是，这种 FlashAttention 的 VarLen，最终其实是不依赖 Mask 的，直接依据有效长度来做 Attention 计算。
     # 传统的 Mask 是**“先算完，再把不想要的挡住”；而 FlashAttention VarLen 是“根本不去算不该看的地方”**。
-    # VarLen 会代替两种 Mask 逻辑（但实际上不引入 Mask），一是样本隔离，它通过 cu_seqlens 确保了样本之间完全不可见。样本 A 的 token 永远不会和样本 B 的 token 产生计算关系。二是因果掩码，如果你在调用函数时设置了 causal=True，它会在每个样本的内部（即每个“块”内部）自动应用下三角掩码，这种计算是在寄存器层面完成的，速度极快。
+    # VarLen 会代替两种 Mask 逻辑（但实际上不引入 Mask），一是样本隔离，它通过 cu_seqlens 确保了样本之间完全不可见。样本 A 的 token 永远不会和样本 B 的 token 产生计算关系。二是因果掩码，如果我们在调用函数时设置了 causal=True，它会在每个样本的内部（即每个“块”内部）自动应用下三角掩码，这种计算是在寄存器层面完成的，速度极快。
     
 # -----------------------------------------------------------------------------
 # helper function for HellaSwag eval
@@ -637,12 +637,12 @@ import torch.distributed as dist
 
 # set up DDP (distributed data parallel).
 # torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
-# 这些环境变量（RANK, LOCAL_RANK, WORLD_SIZE）不是操作系统自带的，也不是你手动在 .bashrc 里写的，而是由 PyTorch 的启动器（Launcher） 自动注入的。
-# 通常你会使用命令 torchrun --nproc_per_node=8 train.py 启动程序，当执行 torchrun 时，它会做以下几件事：
+# 这些环境变量（RANK, LOCAL_RANK, WORLD_SIZE）不是操作系统自带的，也不是我们手动在 .bashrc 里写的，而是由 PyTorch 的启动器（Launcher） 自动注入的。
+# 通常我们会使用命令 torchrun --nproc_per_node=8 train.py 启动程序，当执行 torchrun 时，它会做以下几件事：
 # 1. 分身：在后台启动 8 个完全相同的 train.py 进程。
 # 2. 发证：给每个进程通过“环境变量”塞入不同的编号。
-#  - RANK: 告诉这个进程你在全球（所有机器）是第几个。
-#  - LOCAL_RANK: 告诉这个进程你在当前这台机器上是第几个（用来绑定 GPU）。
+#  - RANK: 告诉这个进程我们在全球（所有机器）是第几个。
+#  - LOCAL_RANK: 告诉这个进程我们在当前这台机器上是第几个（用来绑定 GPU）。
 #  - WORLD_SIZE: 告诉进程总共有多少个分身在跑。
 # 3. 握手：代码中的 init_process_group 会根据这些环境变量，让这 8 个进程互相认识，建立起通信网络。
 
@@ -652,18 +652,18 @@ if ddp:
     assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
     init_process_group(backend='nccl')
     # NCCL (发音为 "Nickel") 全称是 NVIDIA Collective Communications Library。它是 NVIDIA 开发的一个库，专门用于多 GPU 之间的高性能通信。
-    # 如果你的多张显卡想要互相传输数据（比如同步梯度），直接走 CPU 转发会非常慢。NCCL 能够绕过 CPU，利用 NVLink（显卡间的“高速公路”）或 PCIe 直接在 GPU 之间暴力传输数据。在 NVIDIA GPU 上进行深度学习分布式训练时，NCCL 是绝对的行业标准，速度远快于 gloo 或 mpi 后端。
+    # 如果我们的多张显卡想要互相传输数据（比如同步梯度），直接走 CPU 转发会非常慢。NCCL 能够绕过 CPU，利用 NVLink（显卡间的“高速公路”）或 PCIe 直接在 GPU 之间暴力传输数据。在 NVIDIA GPU 上进行深度学习分布式训练时，NCCL 是绝对的行业标准，速度远快于 gloo 或 mpi 后端。
     # NLCC 做了下面几件事情：
     # 1. 建立通信网（Rendezvous / 握手）。所有并行的进程（Rank 0, Rank 1...）会通过一个共同的地址（通常是环境变量中的 MASTER_ADDR 和 MASTER_PORT）互相打招呼。直到所有进程都到齐了，这个函数才会返回。如果有一个进程掉队，程序就会卡在这里直到超时。
-    # 2.  确认拓扑结构。NCCL 会自动侦测你机器上的硬件布局，哪些 GPU 之间有 NVLink？哪些是通过 PCIe 总线连接的？它会自动计算出一条最优的数据传输路径（比如采用 Ring-AllReduce 算法，让数据像接力赛一样在显卡间流转）。
+    # 2.  确认拓扑结构。NCCL 会自动侦测我们机器上的硬件布局，哪些 GPU 之间有 NVLink？哪些是通过 PCIe 总线连接的？它会自动计算出一条最优的数据传输路径（比如采用 Ring-AllReduce 算法，让数据像接力赛一样在显卡间流转）。
     # 3. 初始化通信缓冲区。在 GPU 显存中划出一块专门的区域，用于存放待发送和接收的梯度数据。
     ddp_rank = int(os.environ['RANK'])
     ddp_local_rank = int(os.environ['LOCAL_RANK'])
     ddp_world_size = int(os.environ['WORLD_SIZE'])
     device = f'cuda:{ddp_local_rank}'
     torch.cuda.set_device(device)
-    # 在多 GPU 训练中，虽然你启动了多个进程，但默认情况下，每个进程看到的第一块显卡都是 cuda:0。如果不通过这行代码明确指定，所有进程都会挤在第一张显卡上抢资源，导致显存溢出（OOM）或极低的运行效率。
-    # 这行代码告诉当前的 Python 进程：“从现在起，后续所有没有明确指定 ID 的 CUDA 操作，全部默认发送到这张卡上。”设定默认设备： 比如你执行 x = torch.randn(10).cuda()，PyTorch 就会把 x 放到你刚刚 set_device 指定的那张卡上。隔离进程： 在 DDP（分布式数据并行）中，每个进程负责一张卡。通过 ddp_local_rank（比如 0, 1, 2, 3），让进程 0 用卡 0，进程 1 用卡 1，实现物理上的并行。
+    # 在多 GPU 训练中，虽然我们启动了多个进程，但默认情况下，每个进程看到的第一块显卡都是 cuda:0。如果不通过这行代码明确指定，所有进程都会挤在第一张显卡上抢资源，导致显存溢出（OOM）或极低的运行效率。
+    # 这行代码告诉当前的 Python 进程：“从现在起，后续所有没有明确指定 ID 的 CUDA 操作，全部默认发送到这张卡上。”设定默认设备： 比如我们执行 x = torch.randn(10).cuda()，PyTorch 就会把 x 放到我们刚刚 set_device 指定的那张卡上。隔离进程： 在 DDP（分布式数据并行）中，每个进程负责一张卡。通过 ddp_local_rank（比如 0, 1, 2, 3），让进程 0 用卡 0，进程 1 用卡 1，实现物理上的并行。
     master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
 else:
     # vanilla, non-DDP run
@@ -774,17 +774,17 @@ if ddp:
     # 异步 All-Reduce：它不会等整棵树都算完才同步，而是在计算倒数第一层梯度的同时，就开始把倒数第二层的梯度通过 NCCL 往其他卡上发。这种**计算与通信重叠（Overlapping）**的策略，是大规模训练效率极高的原因。
     model = DDP(model, device_ids=[ddp_local_rank])
     # DDP(model, ...)：多卡同步器
-    # 在做什么：把你的单机模型包装成一个“分布式版本”。
+    # 在做什么：把我们的单机模型包装成一个“分布式版本”。
     # 有什么用：
     # - 梯度同步：当 loss.backward() 执行时，DDP 会自动触发我们在前面提到的 NCCL All-Reduce，把所有卡的梯度平均化。
     # - 状态同步：确保训练开始前，所有卡的模型参数初始值完全一致。
     # 关键参数 device_ids=[ddp_local_rank]：这行非常重要！它告诉 DDP 这一份进程只管这一块 GPU，避免了多个进程抢夺同一块卡。
 raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 # 这是这段代码中最具智慧的一行，也是为了解决“模型嵌套”问题。
-# 问题的由来：一旦你用了 DDP 包装模型，你的原始模型就被套在了 DDP 对象的内部。原本你访问 model.transformer，现在必须访问 model.module.transformer。
+# 问题的由来：一旦我们用了 DDP 包装模型，我们的原始模型就被套在了 DDP 对象的内部。原本我们访问 model.transformer，现在必须访问 model.module.transformer。
 # 有什么用：
-# - 统一访问入口：无论你是在单卡跑（没加 DDP）还是多卡跑（加了 DDP），raw_model 永远指向那个纯净的、没有被包装的原始模型。
-# - 保存模型：当你保存 checkpoint 时，你肯定希望保存的是 raw_model.state_dict()。如果直接保存 model.state_dict()，权重键值对里会全是 module.xxx，这会导致你以后在单卡加载时报错。
+# - 统一访问入口：无论我们是在单卡跑（没加 DDP）还是多卡跑（加了 DDP），raw_model 永远指向那个纯净的、没有被包装的原始模型。
+# - 保存模型：当我们保存 checkpoint 时，我们肯定希望保存的是 raw_model.state_dict()。如果直接保存 model.state_dict()，权重键值对里会全是 module.xxx，这会导致我们以后在单卡加载时报错。
 # 为什么要这么写：为了后续代码的整洁。无论环境怎么变，只要涉及到修改模型参数、保存模型、或者调用模型自定义方法，统一用 raw_model 就不会出错。
 
 max_lr = 6e-4
@@ -1023,13 +1023,13 @@ for step in range(max_steps):
         # 它是“重叠执行”的（计算与通信异步并行，但最终结果同步）。
 
         # A. 从“通信过程”看：它是异步/重叠的
-        # 当你调用 loss.backward() 时，DDP 不会等梯度全部算完才开始同步。
+        # 当我们调用 loss.backward() 时，DDP 不会等梯度全部算完才开始同步。
         # 立即触发：一旦某个参数（比如模型最后一层）的梯度算出来了，DDP 就会立即在后台启动该参数的 All-Reduce 通信（通过 NCCL）。
         # 边算边传：在计算前几层梯度的同时，后几层的梯度已经在网线/总线上传输了。这种“重叠（Overlapping）”是 DDP 效率极高的原因。
 
         # B. 从“代码执行”看：它是准同步的
-        # 虽然通信在后台异步发生，但当你这行 loss.backward() 执行完毕并跳到下一行时，PyTorch 会确保所有必要的通信已经完成。
-        # 这意味着，当代码运行到 loss.backward() 下一行时，你拿到的梯度已经是全集群平均后的结果了。
+        # 虽然通信在后台异步发生，但当我们这行 loss.backward() 执行完毕并跳到下一行时，PyTorch 会确保所有必要的通信已经完成。
+        # 这意味着，当代码运行到 loss.backward() 下一行时，我们拿到的梯度已经是全集群平均后的结果了。
     
     # 上述过程在做梯度累积，有三个问题：
 
@@ -1055,7 +1055,7 @@ for step in range(max_steps):
         # - 行为：当程序运行到这一行时，它会停下来（阻塞）。
         # - 等待：它会等待所有其他进程都运行到它们各自的 all_reduce 这一行。
         # - 释放：只有当所有卡都交换完数据并完成了平均值计算，程序才会继续向下执行下一行代码。
-        # - 注意：如果你希望它是异步的，需要加上 async_op=True，这样它会返回一个 handle，你可以先做别的，稍后再调用 handle.wait()。
+        # - 注意：如果我们希望它是异步的，需要加上 async_op=True，这样它会返回一个 handle，我们可以先做别的，稍后再调用 handle.wait()。
         
 
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
