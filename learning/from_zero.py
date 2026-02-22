@@ -439,6 +439,8 @@ import numpy as np
 from ..hellaswag import render_example, iterate_examples
 
 def load_tokens(filename):
+    # 加载 fineweb-edu token。
+    # 数据集的 token 化已经在 fineweb.py 中执行过了。
     npt = np.load(filename)
     npt = npt.astype(np.int32) # added after video
     ptt = torch.tensor(npt, dtype=torch.long)
@@ -464,19 +466,28 @@ class DataLoaderLite:
     #   - Multiprocessing（多线程）： 使用 num_workers 开启多个进程并行加载数据，防止 CPU 加载太慢让 GPU “空转”。
     #   - Drop Last： 如果总数据量不能被 Batch Size 整除，决定是否舍弃最后不完整的一块。
     def __init__(self, B, T, process_rank, num_processes, split):
+        # dataloader 应该随机采样
+        # 数据在硬盘上的存储顺序往往不是随机的，可能带有某种偏见：
+        # - 按类别排序： 比如一个数据集前 1000 条全是“猫”，后 1000 条全是“狗”。如果不 shuffle，模型在训练前期会认为“世界上只有猫”，权重会剧烈向猫偏移；等训练到后期看到狗时，又会痛苦地推翻之前的认知。
+        # - 按采集时间排序： 比如白天的照片在前，晚上的在后。模型可能会错误地把“光线亮度”和“物体类别”联系起来，产生伪相关（Spurious Correlation）。
+        # - Shuffle 的作用： 确保每个 Batch 都是整个数据集的一个无偏随机采样，让模型在每一步更新时都能看到全局分布的缩影。
         self.B = B
         self.T = T
         self.process_rank = process_rank
         self.num_processes = num_processes
         assert split in {'train', 'val'}
+        # 加载不同的数据集，包括了 train 和 val。
 
         # get the shard filenames
         data_root = "edu_fineweb10B"
         shards = os.listdir(data_root)
         shards = [s for s in shards if split in s]
+        # 拿到所有的数据分片，只拿 val 或者只拿 train 的数据。
         shards = sorted(shards)
+        # 对分片进行排序。
         shards = [os.path.join(data_root, s) for s in shards]
         self.shards = shards
+        # 或者所有的分片路径，他本质上就是一个路径的 list。
         assert len(shards) > 0, f"no shards found for split {split}"
         if master_process:
             print(f"found {len(shards)} shards for split {split}")
@@ -484,11 +495,11 @@ class DataLoaderLite:
 
     def reset(self):
         # state, init at shard zero
-        self.current_shard = 0
-        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.current_shard = 0 # 目前的分片是 0。
+        self.tokens = load_tokens(self.shards[self.current_shard]) # 加载第 0 个分片。
         # self.B * self.T * self.process_rank 这是为了考虑多多进程加载数据，可以看到数据会被分割成八份，以下面的形式进行多进程读取：
         # GPU0 | GPU1 | GPU2 | GPU3 | GPU4 | GPU5 | GPU6 | GPU7 | GPU0 | GPU1 | GPU2 | GPU3 | GPU4 | GPU5 | ...
-        self.current_position = self.B * self.T * self.process_rank
+        self.current_position = self.B * self.T * self.process_rank # 八卡并行的读取数据。
 
     def next_batch(self):
         B, T = self.B, self.T
@@ -496,20 +507,67 @@ class DataLoaderLite:
         x = (buf[:-1]).view(B, T) # inputs
         y = (buf[1:]).view(B, T) # targets
         # advance the position in the tensor
-        self.current_position += B * T * self.num_processes
+        self.current_position += B * T * self.num_processes # 更新下一个位置。
         # if loading the next batch would be out of bounds, advance to next shard
         if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
             self.current_shard = (self.current_shard + 1) % len(self.shards)
+            # 如果超出了分片内的 token 数，那么更新至下一个分片，会出现循环读取数据的情况。
             self.tokens = load_tokens(self.shards[self.current_shard])
             self.current_position = B * T * self.process_rank
+            # 会存在尾部数据丢失的情况，也就是所谓的 DataLoader 的 DropLast。
+            # 为什么在 LLM 训练（如 NanoGPT）中这样做？
+            # 矩阵形状对齐： 自回归模型要求输入 $x$ 和目标 $y$ 必须是严格的 $[B, T]$ 形状。如果最后剩的数据不够，.view(B, T) 会直接抛出形状不匹配的错误（RuntimeError）。
+            # 分布式效率： 在多 GPU 环境下（num_processes > 1），必须保证每个进程拿到的数据量完全一致，否则某个进程会因为没数据而卡死，导致同步梯度时出现挂起。
+            # 计算简化： 对于动辄数千亿 token 的大模型训练，丢弃每个分片末尾那几十个 token 对收敛完全没有影响，但能极大简化数据加载器的逻辑。
         return x, y
-    
+    # 如果一个句子被切为两个 B 中的 T，造成了语义的不连贯，不会对 LLM 的训练产生影响吗？
+    # 从人类阅读的角度看，把一个句子从中间粗暴切断（比如：第一段末尾是“我爱吃”，第二段开头是“苹果”）确实显得“语义不连贯”。但在大模型的预训练（Pre-training）阶段，这种做法不仅被允许，甚至是标准做法。
+    # 1. 大模型（如 GPT）训练的本质是预测下一个 token（Next Token Prediction）。如果一个句子被切分到两个 Batch 中，模型在处理第二段开头时，虽然在当前 Batch 失去了之前的上下文，但在整个训练过程中，模型会见过无数次类似的截断。重要的是，模型学习的是统计规律。它学习到的是：“当序列以某种特征结束时，后面大概率接什么”。
+    # 2. “海量数据”抹平了局部不连贯。预训练使用的数据量通常是 Trillions（万亿级） 的 token。相对于总数据量，被切断的边界点（Boundary）只占极小比例。即使某个 Batch 的开头看起来莫名其妙，模型通过成千上万次其他完整句子的训练，已经建立起强大的语言表征能力，足以抵消这种局部噪声。
+    # 3. 因果掩码（Causal Masking）的特性。Transformer 使用 Self-Attention 机制。在预训练时，模型被训练去根据前面的 $T-1$ 个 token 预测第 $T$ 个。只要在一个 $T$ 长度的窗口内，逻辑是自洽的，模型就能学到东西。即使窗口开头是半个句子，模型也会根据这半个句子的上下文去预测下一个词，这对模型来说依然是有意义的训练任务。
 
+    # 因此，我们在模型预训练过程中会保持 B 和 T 都是固定的，即使这会带来语义的截断。如果我们为了保证每个句子都不被切断而采用动态长度或大量 Padding，则会有如下几个问题：
+    # - 显存浪费： 很多 Batch 会充满无意义的 [PAD] 占位符。
+    # - 计算效率下降： 训练时间可能延长 20%-50%。结论： 相比于完美的语义连贯，“喂给模型更多的 token” 对模型最终智能的影响要大得多。
+
+    # 虽然我们在预训练的过程中不在乎这种不连贯的问题，但是在 SFT 的情况下，我们会去关注语义的连贯性。
+    # 首先是为什么 SFT 不能像预训练那样“乱切”？
+    # 在预训练时，语料是无限的流；但在 SFT 时，我们有明确的 (Prompt, Response) 结构。
+    # - 逻辑截断风险： 如果一个 Batch 在 Prompt 中间切断，模型就只看到了半个问题，它学到的“预测下一个词”就成了盲目猜测。
+    # - 计算 Loss 的权重： 在 SFT 中，我们通常只对 Response 部分计算 Loss。如果 Response 被切成了两半放在不同的 Batch 里，模型对后半部分的理解就会因为缺失前半部分的上下文（Context）而完全错乱。
+    # - End-of-Sequence (EOS) 标记： SFT 必须让模型学会什么时候该“闭嘴”。如果句子被强制切断而没有出现 <|endoftext|>，模型就永远学不会在正确的地方停止输出。
+
+    # 因此我们需要保证 SFT 的 Prompt + Response 结构是完整的，主要的解决方案有如下：
+    # 1. Padding（简单但低效）。最直观的方法是，给每个样本一个固定的 $T$（比如 2048）。做法： 短句子后面全部补 [PAD] 字符。问题： 如果你的数据集里大部分是短对话（比如 100 token），但你为了兼容长对话设置了 $T=2048$，那么 GPU 显存里 95% 的计算量都在算无意义的 [PAD]。这简直是在烧钱。
+    # 2. packing + Block Diagonal Mask（主流高效）。为了不浪费显存，我们会把多个短样本（S1, S2, S3...）像挤公交车一样，“塞”进同一个长度为 $T$ 的向量里。但是！ 我们必须防止“语义污染”：S2 的开头不能看到 S1 的结尾。
+    #   - 核心技术 1：Block Diagonal Mask（块对角掩码）
+    #   通过定制 Attention Mask，让模型在计算注意力时，眼睛只盯着同一个样本内部。
+    #   样本 1 的 token 只能看到样本 1 的历史。
+    #   样本 2 的第一个 token 即使在物理位置上紧挨着样本 1，但在计算时，Mask 会让它“看不见”样本 1。
+    #   - 核心技术 2：Flash Attention 的 VarLen 模式
+    #   这是目前最硬核的工程实现。传统的 Transformer 需要把数据 Padding 成规整的方阵（Rectangle），而 FlashAttention-2 提供了一个 varlen 接口：
+    #   你传入一个一维的长向量（包含所有样本）。
+    #   再传入一个 cu_seqlens（累积序列长度）数组（例如 [0, 50, 120, 200]，表示第一个样本 50 长，第二个 70 长...）。
+    #   结果： GPU 底层会直接跳过 Padding 部分，只在有效区域内算 Attention。既保证了不互相干扰（连贯性），又实现了 100% 的计算利用率。
+
+    # 这里要重点介绍一下 FlashAttention 的 VarLen 范式。
+    # 在没有 VarLen 之前，即使你把多个样本 Pack 到一起，Transformer 仍然会把它看作一个长度为 $T$ 的单一序列。
+    # - 传统做法： 传入一个 $[B, T, D]$ 的张量。如果你想隔离样本，必须传一个巨大的 $T \times T$ 的 Mask 矩阵。GPU 依然要对 Mask 中为 0（被遮掩）的部分进行计算（虽然结果会被丢弃），这浪费了大量的显存带宽和算子执行时间。
+    # - VarLen 实现： 它直接打破了“矩形”限制。它告诉 GPU：“别管什么 Batch Size 和固定长度了，我给你一个一维的长向量，以及一份索引名单，你按名单在对应的区间里算 Attention 就行。”
+
+    # 在 FlashAttention 的 VarLen 模式下，逻辑上的 $(B, T, D)$ 确实在物理内存上被“摊平”成了 $(\sum L, D)$（其中 $\sum L = B \times T$）。
+    # 传统模型： 像一个规整的长方体。即便某个样本很短，它也要占据 $T$ 那么长的坑位。形状：[Batch, SeqLen, Num_Heads, Head_Dim]FlashAttention VarLen： 像一根长短不一的香肠连在一起。形状：[Total_Tokens, Num_Heads, Head_Dim]这里 Total_Tokens 就是该 Batch 中所有有效 token 的总和。
+    # 在 FlashAttention 的 VarLen 实现里 => 物理存储： 确实是把 $B$ 和 $T$ 压扁成了一维。逻辑处理： 放弃了固定的 $T$ 步长，改用 cu_seqlens 指向的动态步长。
+    # 最重要的是，这种 FlashAttention 的 VarLen，最终其实是不依赖 Mask 的，直接依据有效长度来做 Attention 计算。
+    # 传统的 Mask 是**“先算完，再把不想要的挡住”；而 FlashAttention VarLen 是“根本不去算不该看的地方”**。
+    # VarLen 会代替两种 Mask 逻辑（但实际上不引入 Mask），一是样本隔离，它通过 cu_seqlens 确保了样本之间完全不可见。样本 A 的 token 永远不会和样本 B 的 token 产生计算关系。二是因果掩码，如果你在调用函数时设置了 causal=True，它会在每个样本的内部（即每个“块”内部）自动应用下三角掩码，这种计算是在寄存器层面完成的，速度极快。
+    
 # -----------------------------------------------------------------------------
 # helper function for HellaSwag eval
 # takes tokens, mask, and logits, returns the index of the completion with the lowest loss
 
 def get_most_likely_row(tokens, mask, logits):
+    # 这段逻辑其实就是单独把 hellaswag 的 eval 拆了出来，本质上就是在做逐 token 的损失计算。
     # evaluate the autoregressive loss at all positions
     shift_logits = (logits[..., :-1, :]).contiguous()
     shift_tokens = (tokens[..., 1:]).contiguous()
@@ -647,6 +705,7 @@ if master_process:
 
 train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
 val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
+# 不同的 DataLoader 加载不同的数据。
 
 torch.set_float32_matmul_precision('high')
 # 允许 PyTorch 在进行矩阵乘法（MatMul）时，使用 TensorFloat-32 (TF32) 数据格式，从而在牺牲极小精度的情况下，大幅提升计算速度。
@@ -761,11 +820,12 @@ for step in range(max_steps):
     t0 = time.time()
     last_step = (step == max_steps - 1)
 
-
     # once in a while evaluate our validation loss
+    # 每过 250 个 step，进行一次 eval 评估。
     if step % 250 == 0 or last_step:
         model.eval()
         val_loader.reset()
+        # 数据指针归位。
         with torch.no_grad():
             val_loss_accum = 0.0
             val_loss_steps = 20
@@ -775,6 +835,9 @@ for step in range(max_steps):
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                     logits, loss = model(x, y)
                 loss = loss / val_loss_steps
+                # 在评估（Evaluation）阶段，这种写法非常普遍。
+                # 每个 loss 都除 20，和最后所有的 loss 先求和再除 20，这在数学上是完全等价的。
+                # 这里是评估专有的，和训练中的梯度累积的除法不一样。
                 val_loss_accum += loss.detach()
         if ddp:
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
@@ -783,6 +846,7 @@ for step in range(max_steps):
             with open(log_file, "a") as f:
                 f.write(f"{step} val {val_loss_accum.item():.4f}\n")
             if step > 0 and (step % 5000 == 0 or last_step):
+                # 每训练 5000 个 step 就将当前的 checkpoint 保存下来。
                 # optionally write model checkpoints
                 checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
                 checkpoint = {
@@ -794,6 +858,38 @@ for step in range(max_steps):
                 # you might also want to add optimizer.state_dict() and
                 # rng seeds etc., if you wanted to more exactly resume training
                 torch.save(checkpoint, checkpoint_path)
+                # 一个好的 checkpoint，应该保存如下数据：
+                # checkpoint = {
+                #     # === A. 核心权重 (大脑) ===
+                #     # 使用 raw_model 避开 DDP 的 module. 前缀，确保通用性
+                #     'model': raw_model.state_dict(),
+                #     'config': raw_model.config, # 保存模型架构参数（n_layer, n_head等）
+
+                #     # === B. 动力学状态 (惯性与速度) ===
+                #     'optimizer': optimizer.state_dict(), # Adam 的动量等
+                #     'scheduler': scheduler.state_dict(), # 学习率进度
+                #     # 如果使用了混合精度训练 (Mixed Precision)，必须保存 scaler
+                #     'scaler': scaler.state_dict() if 'scaler' in locals() else None,
+
+                #     # === C. 进度控制 (书签) ===
+                #     'step': step,                  # 当前全局步数
+                #     'epoch': epoch,                # 当前轮次
+                #     'best_val_loss': best_val_loss, # 历史上最好的验证集成绩
+
+                #     # === D. 数据位置 (防止数据重复或遗漏) ===
+                #     'data_loader_state': {
+                #         'current_shard': train_loader.current_shard,
+                #         'current_position': train_loader.current_position,
+                #     },
+
+                #     # === E. 可复现性 (种子) ===
+                #     'rng_state': {
+                #         'python': random.getstate(),
+                #         'numpy': np.random.get_state(),
+                #         'torch': torch.get_rng_state(),
+                #         'cuda': torch.cuda.get_rng_state_all(), # 所有 GPU 的种子
+                #     }
+                # }
 
     
     # once in a while evaluate hellaswag
@@ -803,6 +899,7 @@ for step in range(max_steps):
         for i, example in enumerate(iterate_examples("val")):
             # only process examples where i % ddp_world_size == ddp_rank
             if i % ddp_world_size != ddp_rank:
+                # 这里也是在做并行评估，特定的 GPU 评估特定的 row。
                 continue
             # render the example into tokens and labels
             _, tokens, mask, label = render_example(example)
@@ -813,17 +910,21 @@ for step in range(max_steps):
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                     logits, loss = model(tokens)
                 pred_norm = get_most_likely_row(tokens, mask, logits)
+                # 给出模型认为的答案。
             num_total += 1
             num_correct_norm += int(pred_norm == label)
+            # 判断是否是正确答案。
         # reduce the stats across all processes
         if ddp:
             num_total = torch.tensor(num_total, dtype=torch.long, device=device)
             num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
             dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
             dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
+            # 通过 all_reduce 进行求和。
             num_total = num_total.item()
             num_correct_norm = num_correct_norm.item()
         acc_norm = num_correct_norm / num_total
+        # 获得平均正确率。
         if master_process:
             print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
             with open(log_file, "a") as f:
@@ -831,39 +932,53 @@ for step in range(max_steps):
 
     # once in a while generate from the model (except step 0, which is noise)
     if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile):
+        # 这段代码是一个典型的 大语言模型（LLM）推理采样循环。简单来说，它的任务是：每隔 250 步，让模型针对一个固定的开头（Prompt）续写出 4 段文本。
         model.eval()
         num_return_sequences = 4
         max_length = 32
         tokens = enc.encode("Hello, I'm a language model,")
+        # 首先对原始的文本进行编码，然后将其转化为张量。
         tokens = torch.tensor(tokens, dtype=torch.long)
         tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+        # tokens.unsqueeze(0) 表示在第一维度增加一维，变成了 (1, x)，然后 repeat(4, 1) 表示行复制 4 份，列复制 1 份。
+        # 在 NLP 处理中，我们几乎总是只在 Batch 维度（第 0 维） 上进行重复。
         xgen = tokens.to(device)
         sample_rng = torch.Generator(device=device)
+        # torch.Generator 创建一个独立的随机数生成器。
         sample_rng.manual_seed(42 + ddp_rank)
+        # manual_seed(42 + ddp_rank): 设置随机种子。在分布式训练（DDP）中，有多个 GPU 同时在跑。如果不加 ddp_rank（每个进程的编号），所有显卡生成的随机数序列将完全一致，导致每张显卡打印出来的东西一模一样。加上 ddp_rank 确保了每张显卡生成的文本都有所不同，让我们能看到更多样化的模型表现。
         while xgen.size(1) < max_length:
+            # xgen 的形状是 (Batch, Sequence_Length)，size(1) 表示当前序列的长度，只要当前长度还没达到 max_length（32），就继续生成下一个词。
             # forward the model to get the logits
             with torch.no_grad():
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                     logits, loss = model(xgen) # (B, T, vocab_size)
+                    # 这是一个前置推理的过程，logits 的维度是 (B, T, vocab_size)。
                 # take the logits at the last position
                 logits = logits[:, -1, :] # (B, vocab_size)
+                # 我们只需要当前序列最后一个词预测出的“下一个词”是什么。
+                # -1 表示取时间维度（T）的最后一个位置。现在 logits 变成了 (4, 50257)（假设词表是 GPT-2 的大小）。
                 # get the probabilities
-                probs = F.softmax(logits, dim=-1)
-                # do top-k sampling of 50 (huggingface pipeline default)
-                # topk_probs here becomes (5, 50), topk_indices is (5, 50)
+                probs = F.softmax(logits, dim=-1) 
+                # softmax: 将原始得分（logits）转换为概率（0到1之间，且总和为1）。
+                # probs 是模型对下一个词可能是什么给出的概率分布。
                 topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-                # select a token from the top-k probabilities
-                # note: multinomial does not demand the input to sum to 1
+                # 只保留概率最高的 50 个候选词。这是一种“剪枝”策略，防止模型在采样时选到那些概率极低、乱七八糟的词（比如在中文语境下突然冒出一个奇怪的特殊符号）。
+                # topk_indices 是索引/词号，这 50 个概率最高的词，在原始词表里的“编号”是多少。形状是(Batch_Size, 50)。
+                # topk_probs 是这 50 个词各自对应的“概率得分”是多少。形状是(Batch_Size, 50)。
                 ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # (B, 1)
+                # 根据概率分布进行采样，它不是直接选概率最大的（那个叫 Greedy Search），而是按照概率比例随机选。如果“苹果”概率是 0.7，“橘子”是 0.2，那么它有 70% 的概率选苹果。
                 # gather the corresponding indices
                 xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
-                # append to the sequence
+                # ix 只是 0 到 49 之间的数字。我们需要通过 gather 从 topk_indices 中查表，把它们换回原始词库里真正的 Token ID（比如 15496）。
                 xgen = torch.cat((xgen, xcol), dim=1)
+                # 将新生成的这个词 xcol 拼接到原有序列 xgen 的右侧。下一次循环时，这个新词就会作为输入的一部分，用来预测再下一个词。
         # print the generated text
         for i in range(num_return_sequences):
             tokens = xgen[i, :max_length].tolist()
             decoded = enc.decode(tokens)
             print(f"rank {ddp_rank} sample {i}: {decoded}")
+            # 循环结束后，我们将生成的 Tensor 转换回 Python 列表。enc.decode: 将数字 ID 序列重新翻译成人能看懂的句子。最后在屏幕上打印出该进程生成的 4 条结果。
 
     model.train()
     # 这行代码的作用是将模型设置为训练模式。
